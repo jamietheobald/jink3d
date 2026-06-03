@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# data and generated files
+*.avi
+*.mp4
+*.mov
+*.npy
+*.csv
+*.pkl
+
+# editor/project settings
+.idea/
+.vscode/
+
+# OS noise
+.DS_Store

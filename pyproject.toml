@@ -5,7 +5,7 @@ description = "Add your description here"
 requires-python = ">=3.13"
 dependencies = [
     "numpy>=2.4.6",
-    "opencv-contrib-python>=4.13.0.92",
+    "opencv-contrib-python-headless>=4.13.0.92",
     "pyopengl>=3.1.10",
     "pyopengl-accelerate>=3.1.10",
     "pyqt5>=5.15.11",

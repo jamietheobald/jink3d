@@ -17,3 +17,6 @@ __pycache__/
 
 # OS noise
 .DS_Store
+
+# local data folders
+2026_06_06/

@@ -1,21 +1,16 @@
 #! /usr/bin/env python
 
 '''Stereography window uses pyqtgraph and opencv to mark features from
-two camera views and image the three dimensional reconstruction of
+two camera views and image the three-dimensional reconstruction of
 their paths simultaneously.
 
 '''
 
-# update with drag pt
-
 import numpy as np
 import cv2 as cv
+import configparser
 import os
 import sys
-
-import time
-import datetime
-from string import printable
 
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
@@ -413,7 +408,7 @@ class TDframe():
                     pts0 = np.empty((0, 1, 2), dtype=np.float32)
                     pts1 = np.empty((0, 1, 2), dtype=np.float32)
 
-            # Checkerboard/circle grid: both views should already have the
+            # Checkerboard or circle grid: both views should already have the
             # same number of points. If not, do not crash while inspecting.
             if len(pts0) == len(pts1) and len(pts0) >= 2:
                 h_pts = cv.triangulatePoints(self.ims[0].proj, self.ims[1].proj,
@@ -492,7 +487,7 @@ class TDframe():
                 l_take = np.nonzero(np.isin(l_ids, common_ids))[0]
                 r_take = np.nonzero(np.isin(r_ids, common_ids))[0]
 
-                # Sort both views by corner ID so object/image correspondences match.
+                # Sort both views by corner ID so object image correspondences match.
                 l_take = l_take[np.argsort(l_ids[l_take])]
                 r_take = r_take[np.argsort(r_ids[r_take])]
 
@@ -576,7 +571,10 @@ class TDframe():
             raise ValueError('FPS must be positive')
 
         # Refresh 3D data for this marker in case points were edited after the
-        # last reconstruction.
+        # last reconstruction. Keep the previous orientation because the
+        # reconstructed points (and therefore their acceleration) already
+        # include it.
+        previous_rotation = self.pbrot.copy()
         for im in self.ims:
             im.make_interp(marker_ind)
         self.update_data(marker_ind)
@@ -589,7 +587,9 @@ class TDframe():
         if inds.size < 3:
             raise ValueError('Need at least 3 shared marked frames to estimate acceleration')
 
-        pts = self.data[marker_ind, :, inds].T
+        # Combining a scalar marker index with the advanced frame index puts
+        # the frame dimension first, so this is already shaped (frames, 3).
+        pts = self.data[marker_ind, :, inds]
         finite = np.all(np.isfinite(pts), axis=1)
         inds = inds[finite]
         pts = pts[finite]
@@ -615,12 +615,18 @@ class TDframe():
         else:
             accel = np.nanmean(accels, axis=0)
 
-        self.pbrot = self._rotation_from_vector_to_down(accel)
+        correction = self._rotation_from_vector_to_down(accel)
+        self.pbrot = correction @ previous_rotation
         self.got_pb = True
+
+        # Apply the new coordinate system immediately to every reconstructed
+        # marker, rather than waiting for the user to edit each marker again.
+        for ind in range(self.num_markers):
+            self.update_data(ind)
 
         mag = np.linalg.norm(accel)
         return (
-            f'projectile orientation from marker {marker_ind + 1}\n'
+            f'thrown-object orientation from marker {marker_ind + 1}\n'
             f'frames used: {inds.tolist()}\n'
             f'acceleration vector: {accel}\n'
             f'acceleration magnitude: {mag:.3f} calibration-units/s^2'
@@ -639,20 +645,23 @@ class TDframe():
 
         if len(inds) > 0:
 
+            previous_rotation = self.pbrot.copy()
+
             m1 = self.data[0, :, inds].mean(0)
             m2 = self.data[1, :, inds].mean(0)
 
             # plumbline is the vector pointing toward the true down
             self.pb = m2 - m1
 
-            self.pbrot = self._rotation_from_vector_to_down(self.pb)
+            correction = self._rotation_from_vector_to_down(self.pb)
+            self.pbrot = correction @ previous_rotation
 
             self.got_pb = True
+            for marker_ind in range(self.num_markers):
+                self.update_data(marker_ind)
             return 'found new plumbline'
 
         else:
-
-            self.pbrot = np.eye(3)
             return "couldn't find plumbline---use marker 1 and 2 in at least one pair of frames"
 
 
@@ -1300,7 +1309,7 @@ def circle_grid_detection_candidates(cols, rows, spacing, grid_type='asymmetric_
     Each candidate has a pattern size for findCirclesGrid, flags, object
     points with matching length, and a descriptive name. The alternating-row
     case tries the common row-pair convention first, because some printed
-    asymmetric grids are described as alternating short/long rows even though
+    asymmetric grids are described as alternating short and long rows even though
     OpenCV detects them as a logical grid.
     """
     cols = max(1, int(cols))
@@ -1974,7 +1983,7 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
         self.board_preview.set_board_type(board_type)
         self._update_board_preview()
 
-        # Column/row controls, preview, size/spacing, and detection region are
+        # Column and row controls, preview, size and spacing, and detection region are
         # used by all implemented board types. For checkerboards these are
         # board squares; the calibration call subtracts one to get inner
         # intersections. For asymmetric circle grids, two compact column-count
@@ -2008,19 +2017,19 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
 
         if is_charuco:
             self.note.setText(
-                'ChArUco: columns/rows are board squares. Marker size and dictionary must match the printed board.'
+                'ChArUco: columns and rows are board squares. Marker size and dictionary must match the printed board.'
             )
         elif is_checkerboard:
             self.note.setText(
-                'Checkerboard: columns/rows are board squares in the preview; calibration uses one fewer inner corner in each direction.'
+                'Checkerboard: columns and rows are board squares in the preview; calibration uses one fewer inner corner in each direction.'
             )
         elif is_circle_grid:
             if circle_kind == 'symmetric':
                 self.note.setText(
-                    'Symmetric circle grid: columns/rows are circle centers. Size is center-to-center spacing.')
+                    'Symmetric circle grid: columns and rows are circle centers. Size is center-to-center spacing.')
             else:
                 self.note.setText(
-                    'Asymmetric circle grid: odd/even column counts repeat down the board and must differ by at most one. Rows are total circle rows. Size is nearest-neighbor center spacing. Test this mode before calibration because OpenCV circle-grid conventions vary.'
+                    'Asymmetric circle grid: odd and even column counts repeat down the board and must differ by at most one. Rows are total circle rows. Size is nearest-neighbor center spacing. Test this mode before calibration because OpenCV circle-grid conventions vary.'
                 )
         else:
             self.note.setText('This board type is a placeholder for the later unified calibration dialog.')
@@ -2323,7 +2332,8 @@ class OrientationCalibrationDialog(QtWidgets.QDialog):
     def __init__(self, st_win, parent=None):
         super().__init__(parent)
         self.st_win = st_win
-        self.setWindowTitle('Orientation / gravity')
+        self.setWindowTitle('Orientation of gravity')
+        self.resize(640, 360)
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -2339,8 +2349,7 @@ class OrientationCalibrationDialog(QtWidgets.QDialog):
 
         self.method = QtWidgets.QComboBox()
         self.method.addItem('Plumbline: marker 1 top, marker 2 bottom', 'plumbline')
-        self.method.addItem('Projectile center point: marker acceleration', 'projectile_center')
-        self.method.addItem('Projectile wand center of mass (later)', 'projectile_wand')
+        self.method.addItem('Thrown object: marker acceleration', 'projectile_center')
         form.addRow('Method:', self.method)
 
         self.projectile_widget = QtWidgets.QWidget()
@@ -2348,10 +2357,10 @@ class OrientationCalibrationDialog(QtWidgets.QDialog):
         projectile_layout.setContentsMargins(0, 0, 0, 0)
 
         self.projectile_marker = QtWidgets.QSpinBox()
-        self.projectile_marker.setRange(1, 9)
+        self.projectile_marker.setRange(1, max(1, int(st_win.num_markers)))
         self.projectile_marker.setValue(1)
         self.projectile_marker.setMaximumWidth(60)
-        projectile_layout.addRow('Projectile marker:', self.projectile_marker)
+        projectile_layout.addRow('Thrown-object marker:', self.projectile_marker)
 
         self.projectile_fps = QtWidgets.QDoubleSpinBox()
         self.projectile_fps.setRange(0.001, 100000.0)
@@ -2377,14 +2386,29 @@ class OrientationCalibrationDialog(QtWidgets.QDialog):
         self._method_changed()
 
     def _default_fps(self):
-        """Use the first loaded video FPS when available, otherwise 500."""
-        try:
-            fps = float(self.st_win.ims[0].cap.get(cv.CAP_PROP_FPS))
-            if np.isfinite(fps) and fps > 0:
-                return fps
-        except Exception:
-            pass
-        return 500.0
+        """Read matching camera configuration files, otherwise use 30 FPS."""
+        fps_values = []
+        for im in self.st_win.ims:
+            video_fn = getattr(im, 'fn', '')
+            if not video_fn:
+                return 30.0
+
+            config_fn = os.path.splitext(video_fn)[0] + '.cfg'
+            parser = configparser.ConfigParser()
+            try:
+                with open(config_fn, encoding='utf-8') as config_file:
+                    parser.read_file(config_file)
+                fps = parser.getfloat('Record', 'fps')
+            except (OSError, UnicodeError, configparser.Error, ValueError):
+                return 30.0
+
+            if not np.isfinite(fps) or fps <= 0:
+                return 30.0
+            fps_values.append(fps)
+
+        if len(fps_values) != 2 or not np.isclose(fps_values[0], fps_values[1]):
+            return 30.0
+        return float(fps_values[0])
 
     def _method_changed(self):
         method = self.method.currentData()
@@ -2408,7 +2432,6 @@ class OrientationCalibrationDialog(QtWidgets.QDialog):
             ok_button.setEnabled(True)
 
         else:
-            self.note.setText('This orientation method is a placeholder for a later version.')
             ok_button.setEnabled(False)
 
     def settings(self):
@@ -2615,7 +2638,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
 
         cal_menu.addSeparator()
 
-        orientation_action = QtWidgets.QAction('Orientation / gravity...', self)
+        orientation_action = QtWidgets.QAction('Orientation of gravity...', self)
         orientation_action.triggered.connect(self.open_orientation_dialog)
         cal_menu.addAction(orientation_action)
 
@@ -2951,7 +2974,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
             )
 
     def open_orientation_dialog(self):
-        """Open the orientation/gravity calibration dialog."""
+        """Open the orientation of gravity calibration dialog."""
         dialog = OrientationCalibrationDialog(self, self)
         if dialog.exec_() != QtWidgets.QDialog.Accepted:
             return
@@ -3183,13 +3206,13 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
     def get_projectile_orientation(self, marker_ind=0, fps=1.0):
         '''Orient the scene by fitting gravity from a projectile trajectory.'''
         if self.td.got_cal is None:
-            self.console_write('Need camera geometry before projectile orientation.', 'orientation')
+            self.console_write('Need camera geometry before thrown-object orientation.', 'orientation')
             return
 
         try:
             result = self.td.get_projectile_orientation(marker_ind=marker_ind, fps=fps)
         except Exception as e:
-            self.console_write(f'Projectile orientation failed: {e}', 'orientation')
+            self.console_write(f'Thrown-object orientation failed: {e}', 'orientation')
             return
 
         self.console_write(result, 'orientation')
@@ -3929,4 +3952,3 @@ s.run()
 # fc = cv.findChessboardCorners
 # fl = cv.CALIB_CB_ADAPTIVE_THRESH + cv.CALIB_CB_NORMALIZE_IMAGE
 # n = (7,6)
-

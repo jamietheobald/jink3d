@@ -8,7 +8,6 @@ their paths simultaneously.
 
 import numpy as np
 import cv2 as cv
-import configparser
 import os
 import sys
 
@@ -631,20 +630,18 @@ class TDframe():
                       [-axis[1], axis[0], 0]])
         return np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
 
-    def get_projectile_orientation(self, marker_ind=0, fps=1.0):
+    def get_projectile_orientation(self, marker_ind=0):
         '''Use the acceleration of a marked projectile to define down.
 
         The marker should track the center of a freely thrown object across
         frames. The camera geometry must already be calibrated so that 2D
         camera points can be reconstructed in 3D. The fitted second derivative
-        gives the gravity vector in calibration-units per second squared.
+        gives the gravity vector in calibration-units per frame squared.
         '''
         if self.got_cal is None:
             raise ValueError('Need camera geometry before projectile orientation')
 
-        fps = float(fps)
-        if fps <= 0:
-            raise ValueError('FPS must be positive')
+        marker_ind = int(marker_ind)
 
         # Refresh 3D data for this marker in case points were edited after the
         # last reconstruction. Keep the previous orientation because the
@@ -673,8 +670,8 @@ class TDframe():
         if inds.size < 3:
             raise ValueError('Need at least 3 finite 3D positions to estimate acceleration')
 
-        t = inds.astype(float) / fps
-        k = min(3, inds.size - 1)
+        t = inds.astype(float)
+        k = min(3, int(inds.size) - 1)
         if k < 2:
             raise ValueError('Need enough frames for at least a quadratic fit')
 
@@ -701,11 +698,12 @@ class TDframe():
             self.update_data(ind)
 
         mag = np.linalg.norm(accel)
+        direction = accel / mag
         return (
             f'thrown-object orientation from marker {marker_ind + 1}\n'
             f'frames used: {inds.tolist()}\n'
-            f'acceleration vector: {accel}\n'
-            f'acceleration magnitude: {mag:.3f} calibration-units/s^2'
+            f'acceleration direction: {direction}\n'
+            f'relative acceleration magnitude: {mag:.3f} calibration-units/frame^2'
         )
 
     def get_plumbline(self):
@@ -966,20 +964,21 @@ class Imframe():
         number of filled frames, up to a cubic spline.
 
         '''
-        num_filled_frames = sum(self.data[marker_ind, -1])
+        marker_ind = int(marker_ind)
+        num_filled_frames = int(np.count_nonzero(self.data[marker_ind, -1]))
         if num_filled_frames >= 2:
-            kval = np.clip(num_filled_frames - 1, 1, 3)
+            kval = min(num_filled_frames - 1, 3)
 
             # get values at marked frames
-            ts = np.where(self.data[marker_ind, -1] == 1)
-            xs = self.data[marker_ind, 0][ts]
-            ys = self.data[marker_ind, 1][ts]
+            ts = np.flatnonzero(self.data[marker_ind, -1] == 1).astype(int)
+            xs = self.data[marker_ind, 0, ts]
+            ys = self.data[marker_ind, 1, ts]
 
-            self.interp[marker_ind][0] = InterpolatedUnivariateSpline(ts[0], xs, k=kval, ext='raise')
-            self.interp[marker_ind][1] = InterpolatedUnivariateSpline(ts[0], ys, k=kval, ext='raise')
+            self.interp[marker_ind][0] = InterpolatedUnivariateSpline(ts, xs, k=kval, ext='raise')
+            self.interp[marker_ind][1] = InterpolatedUnivariateSpline(ts, ys, k=kval, ext='raise')
 
             knots = self.interp[marker_ind][0].get_knots()
-            valid_frames = np.arange(knots.min(), knots.max(), dtype='int')
+            valid_frames = np.arange(int(knots.min()), int(knots.max()), dtype=int)
             self.data[marker_ind, 0, valid_frames] = self.interp[marker_ind][0](valid_frames)
             self.data[marker_ind, 1, valid_frames] = self.interp[marker_ind][1](valid_frames)
 
@@ -2464,13 +2463,6 @@ class OrientationCalibrationDialog(QtWidgets.QDialog):
         self.projectile_marker.setMaximumWidth(60)
         projectile_layout.addRow('Thrown-object marker:', self.projectile_marker)
 
-        self.projectile_fps = QtWidgets.QDoubleSpinBox()
-        self.projectile_fps.setRange(0.001, 100000.0)
-        self.projectile_fps.setDecimals(3)
-        self.projectile_fps.setValue(self._default_fps())
-        self.projectile_fps.setMaximumWidth(100)
-        projectile_layout.addRow('Frame rate:', self.projectile_fps)
-
         form.addRow('', self.projectile_widget)
 
         self.note = QtWidgets.QLabel('')
@@ -2486,31 +2478,6 @@ class OrientationCalibrationDialog(QtWidgets.QDialog):
 
         self.method.currentIndexChanged.connect(self._method_changed)
         self._method_changed()
-
-    def _default_fps(self):
-        """Read matching camera configuration files, otherwise use 30 FPS."""
-        fps_values = []
-        for im in self.st_win.ims:
-            video_fn = getattr(im, 'fn', '')
-            if not video_fn:
-                return 30.0
-
-            config_fn = os.path.splitext(video_fn)[0] + '.cfg'
-            parser = configparser.ConfigParser()
-            try:
-                with open(config_fn, encoding='utf-8') as config_file:
-                    parser.read_file(config_file)
-                fps = parser.getfloat('Record', 'fps')
-            except (OSError, UnicodeError, configparser.Error, ValueError):
-                return 30.0
-
-            if not np.isfinite(fps) or fps <= 0:
-                return 30.0
-            fps_values.append(fps)
-
-        if len(fps_values) != 2 or not np.isclose(fps_values[0], fps_values[1]):
-            return 30.0
-        return float(fps_values[0])
 
     def _method_changed(self):
         method = self.method.currentData()
@@ -2540,7 +2507,6 @@ class OrientationCalibrationDialog(QtWidgets.QDialog):
         return {
             'method': self.method.currentData(),
             'projectile_marker_ind': int(self.projectile_marker.value()) - 1,
-            'projectile_fps': float(self.projectile_fps.value()),
         }
 
 
@@ -3086,8 +3052,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
             self.get_plumbline()
         elif settings['method'] == 'projectile_center':
             self.get_projectile_orientation(
-                marker_ind=settings['projectile_marker_ind'],
-                fps=settings['projectile_fps']
+                marker_ind=settings['projectile_marker_ind']
             )
         else:
             self.console_write(
@@ -3305,14 +3270,14 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
 
         self.console_write(f'{self.td.pbrot}', 'orientation rotation')
 
-    def get_projectile_orientation(self, marker_ind=0, fps=1.0):
+    def get_projectile_orientation(self, marker_ind=0):
         '''Orient the scene by fitting gravity from a projectile trajectory.'''
         if self.td.got_cal is None:
             self.console_write('Need camera geometry before thrown-object orientation.', 'orientation')
             return
 
         try:
-            result = self.td.get_projectile_orientation(marker_ind=marker_ind, fps=fps)
+            result = self.td.get_projectile_orientation(marker_ind=marker_ind)
         except Exception as e:
             self.console_write(f'Thrown-object orientation failed: {e}', 'orientation')
             return

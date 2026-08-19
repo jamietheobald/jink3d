@@ -44,6 +44,34 @@ mix = np.roll(mix[::-1], 4)
 colors = [cm_soapbubble(.6, y) for y in mix / 9. * 2 * np.pi]
 
 
+def _opencv_image_points(points, name='image points'):
+    """Return OpenCV 2D calibration points as float32 (N, 1, 2)."""
+    points = np.asarray(points)
+    original_shape = points.shape
+    if points.ndim == 2 and points.shape[1] == 2:
+        pass
+    elif points.ndim == 3 and points.shape[1:] == (1, 2):
+        pass
+    else:
+        raise ValueError(
+            f'{name} must have shape (N, 2) or (N, 1, 2); got {original_shape}'
+        )
+    return np.asarray(points, dtype=np.float32).reshape(-1, 1, 2)
+
+
+def _opencv_corner_ids(ids, name='corner IDs'):
+    """Return OpenCV corner IDs as int32 (N, 1)."""
+    ids = np.asarray(ids)
+    original_shape = ids.shape
+    if ids.ndim == 1:
+        pass
+    elif ids.ndim == 2 and ids.shape[1] == 1:
+        pass
+    else:
+        raise ValueError(f'{name} must have shape (N,) or (N, 1); got {original_shape}')
+    return np.asarray(ids, dtype=np.int32).reshape(-1, 1)
+
+
 class TableSizeSelector(QtWidgets.QWidget):
     def __init__(self, st_win=None, parent=None):
         super().__init__()
@@ -248,16 +276,27 @@ class TDframe():
 
         if len(valid_inds) > 0:
             # get undistorted points
-            self.pts0 = self.ims[0].data[marker_ind, :2, valid_inds].T
+            self.pts0 = _opencv_image_points(
+                self.ims[0].data[marker_ind, :2, valid_inds], 'left marker image points'
+            )
             self.upts0 = cv.undistortPoints(self.pts0, self.ims[0].mtx, self.ims[0].dist,
                                             np.eye(3), self.ims[0].mtx)
 
-            self.pts1 = self.ims[1].data[marker_ind, :2, valid_inds].T
+            self.pts1 = _opencv_image_points(
+                self.ims[1].data[marker_ind, :2, valid_inds], 'right marker image points'
+            )
             self.upts1 = cv.undistortPoints(self.pts1, self.ims[1].mtx, self.ims[1].dist,
                                             np.eye(3), self.ims[1].mtx)
 
+            upts0_xy = np.asarray(self.upts0).reshape(-1, 2)
+            upts1_xy = np.asarray(self.upts1).reshape(-1, 2)
+            if upts0_xy.shape != upts1_xy.shape:
+                raise ValueError(
+                    f'Undistorted camera point shapes do not match: '
+                    f'{upts0_xy.shape} and {upts1_xy.shape}'
+                )
             st_pts = cv.triangulatePoints(self.ims[0].proj, self.ims[1].proj,
-                                          self.upts0, self.upts1)
+                                          upts0_xy.T, upts1_xy.T)
 
             # normalize homogenous coordinates
             st_pts /= st_pts[-1]
@@ -382,8 +421,12 @@ class TDframe():
             cal_ind0 = self.ims[0].cal_inds.index(n)
             cal_ind1 = self.ims[1].cal_inds.index(n)
 
-            pts0 = self.ims[0].image_corners[cal_ind0]
-            pts1 = self.ims[1].image_corners[cal_ind1]
+            pts0 = _opencv_image_points(
+                self.ims[0].image_corners[cal_ind0], 'left calibration image points'
+            )
+            pts1 = _opencv_image_points(
+                self.ims[1].image_corners[cal_ind1], 'right calibration image points'
+            )
 
             ids0 = getattr(self.ims[0], 'image_corner_ids', None)
             ids1 = getattr(self.ims[1], 'image_corner_ids', None)
@@ -391,8 +434,14 @@ class TDframe():
             # ChArUco: keep only shared corner IDs and sort both cameras
             # into the same ID order before triangulating.
             if ids0 and ids1:
-                ids0_frame = ids0[cal_ind0].flatten()
-                ids1_frame = ids1[cal_ind1].flatten()
+                ids0_frame = _opencv_corner_ids(ids0[cal_ind0], 'left ChArUco IDs').ravel()
+                ids1_frame = _opencv_corner_ids(ids1[cal_ind1], 'right ChArUco IDs').ravel()
+                if len(ids0_frame) != len(pts0) or len(ids1_frame) != len(pts1):
+                    raise ValueError(
+                        'ChArUco corner/ID count mismatch: '
+                        f'left points {pts0.shape}, IDs {ids0_frame.shape}; '
+                        f'right points {pts1.shape}, IDs {ids1_frame.shape}'
+                    )
                 common_ids = np.intersect1d(ids0_frame, ids1_frame)
 
                 if common_ids.size >= 2:
@@ -411,9 +460,11 @@ class TDframe():
             # Checkerboard or circle grid: both views should already have the
             # same number of points. If not, do not crash while inspecting.
             if len(pts0) == len(pts1) and len(pts0) >= 2:
+                pts0_xy = np.asarray(pts0).reshape(-1, 2)
+                pts1_xy = np.asarray(pts1).reshape(-1, 2)
                 h_pts = cv.triangulatePoints(self.ims[0].proj, self.ims[1].proj,
-                                             pts0[:, 0].T,
-                                             pts1[:, 0].T)
+                                             pts0_xy.T,
+                                             pts1_xy.T)
                 # divide out for homogenous coordinates
                 h_pts[:3] /= h_pts[3]
 
@@ -476,8 +527,20 @@ class TDframe():
             if left_ids and right_ids:
                 # ChArUco boards may produce different visible corner sets in
                 # the two views. Keep only IDs detected in both cameras.
-                l_ids = left_ids[l_ind].flatten()
-                r_ids = right_ids[r_ind].flatten()
+                l_ids = _opencv_corner_ids(left_ids[l_ind], 'left ChArUco IDs').ravel()
+                r_ids = _opencv_corner_ids(right_ids[r_ind], 'right ChArUco IDs').ravel()
+                l_points = _opencv_image_points(
+                    self.ims[0].image_corners[l_ind], 'left ChArUco image points'
+                )
+                r_points = _opencv_image_points(
+                    self.ims[1].image_corners[r_ind], 'right ChArUco image points'
+                )
+                if len(l_ids) != len(l_points) or len(r_ids) != len(r_points):
+                    raise ValueError(
+                        'ChArUco corner/ID count mismatch: '
+                        f'left points {l_points.shape}, IDs {l_ids.shape}; '
+                        f'right points {r_points.shape}, IDs {r_ids.shape}'
+                    )
                 common_ids = np.intersect1d(l_ids, r_ids)
 
                 if common_ids.size < 6:
@@ -492,12 +555,25 @@ class TDframe():
                 r_take = r_take[np.argsort(r_ids[r_take])]
 
                 self.board_corners.append(self.ims[0].board_corners[l_ind][l_take])
-                self.image0_corners.append(self.ims[0].image_corners[l_ind][l_take])
-                self.image1_corners.append(self.ims[1].image_corners[r_ind][r_take])
+                self.image0_corners.append(l_points[l_take])
+                self.image1_corners.append(r_points[r_take])
             else:
-                self.board_corners.append(self.ims[0].board_corners[l_ind])
-                self.image0_corners.append(self.ims[0].image_corners[l_ind])
-                self.image1_corners.append(self.ims[1].image_corners[r_ind])
+                board_points = self.ims[0].board_corners[l_ind]
+                left_points = _opencv_image_points(
+                    self.ims[0].image_corners[l_ind], 'left calibration image points'
+                )
+                right_points = _opencv_image_points(
+                    self.ims[1].image_corners[r_ind], 'right calibration image points'
+                )
+                if len(board_points) != len(left_points) or len(left_points) != len(right_points):
+                    raise ValueError(
+                        f'Calibration point count mismatch at frame {ind}: '
+                        f'object {np.shape(board_points)}, left {left_points.shape}, '
+                        f'right {right_points.shape}'
+                    )
+                self.board_corners.append(board_points)
+                self.image0_corners.append(left_points)
+                self.image1_corners.append(right_points)
 
         if len(self.board_corners) < 3:
             raise ValueError('Need at least 3 stereo calibration frames with shared board points')
@@ -840,7 +916,9 @@ class Imframe():
         # if this is a calibration frame
         if self.frame_ind in self.cal_inds:
             cal_ind = self.cal_inds.index(self.frame_ind)
-            points = self.image_corners[cal_ind][:, 0]
+            points = _opencv_image_points(
+                self.image_corners[cal_ind], 'calibration marker display points'
+            ).reshape(-1, 2)
             self.nmarkers.setData(pos=points, symbol='o')
             self.nmarkers.setBrush(pg.mkBrush('y'))
             self.nmarkers.show()
@@ -990,6 +1068,7 @@ class Imframe():
                 corners = cv.cornerSubPix(
                     roi, corners, (11, 11), (-1, -1), criteria
                 )
+                corners = _opencv_image_points(corners, f'checkerboard corners at frame {ind}')
                 corners += [x_min, y_min]
                 self.image_corners.append(corners)
                 self.board_corners.append(board_pts.copy())
@@ -1119,9 +1198,18 @@ class Imframe():
                 print(f"{ind} only {corner_count} ChArUco corners found")
                 continue
 
-            charuco_corners = charuco_corners.astype(np.float32)
+            charuco_corners = _opencv_image_points(
+                charuco_corners, f'ChArUco corners at frame {ind}'
+            )
+            charuco_ids = _opencv_corner_ids(
+                charuco_ids, f'ChArUco IDs at frame {ind}'
+            )
+            if len(charuco_corners) != len(charuco_ids):
+                raise ValueError(
+                    f'ChArUco corner/ID count mismatch at frame {ind}: '
+                    f'corners {charuco_corners.shape}, IDs {charuco_ids.shape}'
+                )
             charuco_corners += [x_min, y_min]
-            charuco_ids = charuco_ids.astype(np.int32)
             obj_pts = board_corners[charuco_ids.flatten()]
 
             self.image_corners.append(charuco_corners)
@@ -1198,7 +1286,7 @@ class Imframe():
             centers_found, centers, candidate = find_circle_grid_with_candidates(roi, candidates)
 
             if centers_found:
-                centers = centers.astype(np.float32)
+                centers = _opencv_image_points(centers, f'circle-grid centers at frame {ind}')
                 centers += [x_min, y_min]
                 self.image_corners.append(centers)
                 self.board_corners.append(candidate['object_points'].copy())
@@ -2189,7 +2277,17 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
 
         charuco_corners_full = None
         if charuco_corners is not None and charuco_ids is not None and len(charuco_corners) > 0:
-            charuco_corners_full = charuco_corners.copy().astype(np.float32)
+            charuco_corners_full = _opencv_image_points(
+                charuco_corners, f'ChArUco preview corners at frame {frame_ind}'
+            )
+            charuco_ids = _opencv_corner_ids(
+                charuco_ids, f'ChArUco preview IDs at frame {frame_ind}'
+            )
+            if len(charuco_corners_full) != len(charuco_ids):
+                raise ValueError(
+                    f'ChArUco preview corner/ID count mismatch at frame {frame_ind}: '
+                    f'corners {charuco_corners_full.shape}, IDs {charuco_ids.shape}'
+                )
             charuco_corners_full[:, :, 0] += x_min
             charuco_corners_full[:, :, 1] += y_min
             cv.aruco.drawDetectedCornersCharuco(annotated, charuco_corners_full, charuco_ids, cornerColor=(0, 255, 255))
@@ -2241,11 +2339,13 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
         annotated = frame.copy()
         corner_count = 0
         if corners_found and corners is not None:
-            corners_full = corners.astype(np.float32).copy()
+            corners_full = _opencv_image_points(
+                corners, f'checkerboard preview corners at frame {frame_ind}'
+            )
             corners_full[:, :, 0] += x_min
             corners_full[:, :, 1] += y_min
             corner_count = len(corners_full)
-            for pt in corners_full[:, 0, :]:
+            for pt in np.asarray(corners_full).reshape(-1, 2):
                 cv.circle(annotated, tuple(np.rint(pt).astype(int)), 4, (0, 255, 255), -1, cv.LINE_AA)
 
         pixmap = self._pixmap_from_bgr(annotated)
@@ -2295,11 +2395,13 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
         annotated = frame.copy()
         center_count = 0
         if centers_found and centers is not None:
-            centers_full = centers.astype(np.float32).copy()
+            centers_full = _opencv_image_points(
+                centers, f'circle-grid preview centers at frame {frame_ind}'
+            )
             centers_full[:, :, 0] += x_min
             centers_full[:, :, 1] += y_min
             center_count = len(centers_full)
-            for pt in centers_full[:, 0, :]:
+            for pt in np.asarray(centers_full).reshape(-1, 2):
                 cv.circle(annotated, tuple(np.rint(pt).astype(int)), 4, (0, 255, 255), -1, cv.LINE_AA)
 
         pixmap = self._pixmap_from_bgr(annotated)

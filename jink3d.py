@@ -10,6 +10,7 @@ import numpy as np
 import cv2 as cv
 import os
 import sys
+import pandas as pd
 
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
@@ -69,6 +70,101 @@ def _opencv_corner_ids(ids, name='corner IDs'):
     else:
         raise ValueError(f'{name} must have shape (N,) or (N, 1); got {original_shape}')
     return np.asarray(ids, dtype=np.int32).reshape(-1, 1)
+
+
+def _deeplabcut_bodyparts(dataframe):
+    """Validate a single-animal DLC DataFrame and return bodypart order."""
+    if not isinstance(dataframe, pd.DataFrame):
+        raise ValueError('H5 dataset is not a pandas DataFrame.')
+    columns = dataframe.columns
+    if not isinstance(columns, pd.MultiIndex) or not {'bodyparts', 'coords'} <= set(columns.names):
+        raise ValueError(
+            'H5 file does not contain a standard DeepLabCut bodyparts/coords column structure.'
+        )
+    if 'individuals' in columns.names:
+        raise ValueError('Multi-animal DeepLabCut H5 import is not yet supported.')
+
+    if 'scorer' in columns.names:
+        scorers = list(dict.fromkeys(columns.get_level_values('scorer')))
+        if len(scorers) != 1:
+            raise ValueError(
+                f'DeepLabCut H5 contains {len(scorers)} scorers; exactly one is required.'
+            )
+
+    bodyparts = list(dict.fromkeys(columns.get_level_values('bodyparts')))
+    if not bodyparts:
+        raise ValueError('DeepLabCut H5 contains no bodyparts.')
+
+    coords = set(columns.get_level_values('coords'))
+    if 'x' not in coords or 'y' not in coords:
+        raise ValueError('DeepLabCut file contains no complete x/y coordinates.')
+    return bodyparts
+
+
+def _deeplabcut_to_marker_data(dataframe, num_markers, num_frames):
+    """Convert a validated DLC DataFrame to one normal Jink camera array."""
+    bodyparts = _deeplabcut_bodyparts(dataframe)
+    if len(dataframe) != int(num_frames):
+        raise ValueError(
+            f'DeepLabCut data contain {len(dataframe)} frames, '
+            f'but the destination video contains {int(num_frames)} frames.'
+        )
+
+    marker_data = np.zeros((int(num_markers), 3, int(num_frames)), dtype=float)
+    imported = bodyparts[:min(9, int(num_markers))]
+    part_values = dataframe.columns.get_level_values('bodyparts')
+    coord_values = dataframe.columns.get_level_values('coords')
+
+    for marker_ind, bodypart in enumerate(imported):
+        coordinates = []
+        for coord in ('x', 'y'):
+            take = (part_values == bodypart) & (coord_values == coord)
+            if np.count_nonzero(take) != 1:
+                raise ValueError(
+                    f'DeepLabCut bodypart {bodypart!r} has '
+                    f'{np.count_nonzero(take)} {coord!r} columns; expected one.'
+                )
+            try:
+                coordinates.append(np.asarray(dataframe.loc[:, take].iloc[:, 0], dtype=float))
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f'DeepLabCut bodypart {bodypart!r} has non-numeric {coord} coordinates.'
+                ) from error
+
+        x, y = coordinates
+        finite = np.isfinite(x) & np.isfinite(y)
+        marker_data[marker_ind, 0, finite] = x[finite]
+        marker_data[marker_ind, 1, finite] = y[finite]
+        marker_data[marker_ind, 2, finite] = 1
+
+    return marker_data, bodyparts, imported
+
+
+def _match_deeplabcut_camera(h5_fn, video_fns):
+    """Return the uniquely filename-matched camera index, or None."""
+    h5_name = os.path.splitext(os.path.basename(h5_fn))[0]
+    matches = [
+        camera_ind for camera_ind, video_fn in enumerate(video_fns)
+        if h5_name.startswith(os.path.splitext(os.path.basename(video_fn))[0])
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _read_deeplabcut_h5(fn):
+    """Read the conventional DLC key, or the sole unambiguous HDF key."""
+    with pd.HDFStore(fn, mode='r') as store:
+        keys = store.keys()
+    if '/df_with_missing' in keys:
+        key = '/df_with_missing'
+    elif len(keys) == 1:
+        key = keys[0]
+    elif not keys:
+        raise ValueError('H5 file contains no pandas DataFrame datasets.')
+    else:
+        raise ValueError(
+            f'H5 file contains multiple ambiguous pandas datasets: {", ".join(keys)}'
+        )
+    return pd.read_hdf(fn, key=key)
 
 
 class TableSizeSelector(QtWidgets.QWidget):
@@ -2573,6 +2669,10 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         load_data_action.setShortcut(QtCore.Qt.CTRL + QtCore.Qt.Key_L)
         file_menu.addAction(load_data_action)
 
+        import_dlc_action = QtWidgets.QAction('Import DeepLabCut H5...', self)
+        import_dlc_action.triggered.connect(self.import_deeplabcut_h5)
+        file_menu.addAction(import_dlc_action)
+
         file_menu.addSeparator()
 
         save_data_action = QtWidgets.QAction('Save marker data', self)
@@ -3765,6 +3865,102 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
                 self.camera_to_3d(marker_ind)
 
             self.console_write(fn, 'loaded marker data')
+
+    def import_deeplabcut_h5(self):
+        '''Import one DeepLabCut H5 file into its corresponding camera view.'''
+        video_fns = [getattr(im, 'fn', '') for im in self.ims]
+        if len(video_fns) != 2 or not all(video_fns):
+            self.console_write(
+                'Load a stereo video pair before importing DeepLabCut data.',
+                'DeepLabCut import failed'
+            )
+            return
+
+        fn = str(QtWidgets.QFileDialog.getOpenFileName(
+            self, 'Select DeepLabCut tracking file', '', 'HDF5 files (*.h5 *.hdf5)'
+        )[0])
+        if not fn:
+            return
+
+        try:
+            dataframe = _read_deeplabcut_h5(fn)
+            _deeplabcut_bodyparts(dataframe)
+        except Exception as error:
+            self.console_write(
+                f'{os.path.basename(fn)}: {error}\nNo marker data were changed.',
+                'DeepLabCut import failed'
+            )
+            return
+
+        camera_ind = _match_deeplabcut_camera(fn, video_fns)
+        if camera_ind is None:
+            choices = [
+                f'Camera {ind + 1}: {os.path.basename(video_fn)}'
+                for ind, video_fn in enumerate(video_fns)
+            ]
+            choice, accepted = QtWidgets.QInputDialog.getItem(
+                self,
+                'Select DeepLabCut camera',
+                'Which loaded video does this H5 belong to?',
+                choices,
+                0,
+                False
+            )
+            if not accepted:
+                return
+            camera_ind = choices.index(choice)
+
+        destination = self.ims[camera_ind]
+        if len(dataframe) != destination.num_frames:
+            self.console_write(
+                f'{os.path.basename(fn)} contains {len(dataframe)} frames,\n'
+                f'but {os.path.basename(video_fns[camera_ind])} contains '
+                f'{destination.num_frames} frames.\nNo marker data were changed.',
+                'DeepLabCut import failed'
+            )
+            return
+
+        try:
+            marker_data, bodyparts, imported = _deeplabcut_to_marker_data(
+                dataframe, self.num_markers, destination.num_frames
+            )
+        except Exception as error:
+            self.console_write(
+                f'{os.path.basename(fn)}: {error}\nNo marker data were changed.',
+                'DeepLabCut import failed'
+            )
+            return
+
+        # All reading and validation is complete; only now replace Jink state.
+        destination.set_data(marker_data)
+        self.td.set_data()
+        for marker_ind in range(self.num_markers):
+            self.camera_to_3d(marker_ind)
+
+        # DLC H5 files are import sources, never native Jink save targets.
+        self.data_fn = ''
+        self.get_data_fn = False
+        self.undo_list = []
+
+        self.change_frame(int(self.frame_slider.value()))
+
+        lines = [
+            f'file: {os.path.basename(fn)}',
+            f'camera: {os.path.basename(video_fns[camera_ind])}',
+            f'frames: {len(dataframe)}',
+            f'bodyparts imported: {len(imported)}',
+            '',
+        ]
+        lines.extend(
+            f'marker {marker_ind + 1}: {bodypart}'
+            for marker_ind, bodypart in enumerate(imported)
+        )
+        if len(bodyparts) > len(imported):
+            lines.extend([
+                '',
+                f'{len(bodyparts)} DLC bodyparts found; imported first {len(imported)}.'
+            ])
+        self.console_write('\n'.join(lines), 'DeepLabCut import')
 
     def save_checkerboard(self, fn=None):
         '''Saves all the parameters of a stereo calibration---the matrixes for

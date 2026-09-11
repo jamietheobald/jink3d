@@ -167,6 +167,191 @@ def _read_deeplabcut_h5(fn):
     return pd.read_hdf(fn, key=key)
 
 
+class BlobKalman:
+    """Small constant-velocity Kalman filter using frames as time units."""
+
+    def __init__(self, position, velocity=(0., 0.)):
+        self.state = np.array([position[0], position[1], velocity[0], velocity[1]], dtype=float)
+        self.covariance = np.diag([4., 4., 25., 25.])
+        self.measurement = np.array([[1., 0., 0., 0.], [0., 1., 0., 0.]])
+        self.process_noise = np.diag([.25, .25, 1., 1.])
+        self.measurement_noise = np.eye(2) * 4.
+
+    def predict(self, timestep):
+        timestep = float(timestep)
+        transition = np.array([
+            [1., 0., timestep, 0.],
+            [0., 1., 0., timestep],
+            [0., 0., 1., 0.],
+            [0., 0., 0., 1.],
+        ])
+        self.state = transition @ self.state
+        self.covariance = transition @ self.covariance @ transition.T + self.process_noise
+        return self.state[:2].copy()
+
+    def correct(self, position):
+        position = np.asarray(position, dtype=float)
+        residual = position - self.measurement @ self.state
+        residual_covariance = (
+            self.measurement @ self.covariance @ self.measurement.T
+            + self.measurement_noise
+        )
+        gain = self.covariance @ self.measurement.T @ np.linalg.inv(residual_covariance)
+        self.state += gain @ residual
+        self.covariance = (np.eye(4) - gain @ self.measurement) @ self.covariance
+        return self.state[:2].copy()
+
+
+def _infer_blob_polarity(frame, background, position, minimum_contrast):
+    """Infer light/dark target polarity from a small patch at a seed point."""
+    x, y = np.rint(position).astype(int)
+    radius = 2
+    y0, y1 = max(0, y - radius), min(frame.shape[0], y + radius + 1)
+    x0, x1 = max(0, x - radius), min(frame.shape[1], x + radius + 1)
+    if x0 >= x1 or y0 >= y1:
+        raise ValueError('Seed position lies outside the video frame.')
+    signed_contrast = float(np.mean(
+        frame[y0:y1, x0:x1].astype(float) - background[y0:y1, x0:x1].astype(float)
+    ))
+    required = max(2., float(minimum_contrast) * .25)
+    if not np.isfinite(signed_contrast) or abs(signed_contrast) < required:
+        raise ValueError(
+            'Could not determine whether the target is lighter or darker than the background.'
+        )
+    return 'light' if signed_contrast > 0 else 'dark'
+
+
+def _detect_blob_candidates(frame, background, prediction, settings):
+    """Detect area-filtered blobs in a prediction-centered local ROI."""
+    radius = int(settings['search_radius'])
+    x, y = np.rint(prediction).astype(int)
+    x0, x1 = max(0, x - radius), min(frame.shape[1], x + radius + 1)
+    y0, y1 = max(0, y - radius), min(frame.shape[0], y + radius + 1)
+    if x0 >= x1 or y0 >= y1:
+        return [], None, (x0, y0, x1, y1)
+
+    frame_roi = frame[y0:y1, x0:x1].astype(np.int16)
+    background_roi = background[y0:y1, x0:x1].astype(np.int16)
+    if settings['polarity'] == 'dark':
+        difference = background_roi - frame_roi
+    else:
+        difference = frame_roi - background_roi
+    mask = (difference >= int(settings['minimum_contrast'])).astype(np.uint8)
+    count, labels, stats, centroids = cv.connectedComponentsWithStats(mask, connectivity=8)
+
+    candidates = []
+    for label in range(1, count):
+        area = int(stats[label, cv.CC_STAT_AREA])
+        if area < int(settings['min_blob_area']) or area > int(settings['max_blob_area']):
+            continue
+        cx, cy = centroids[label]
+        center = np.array([cx + x0, cy + y0], dtype=float)
+        component = labels == label
+        candidates.append({
+            'position': center,
+            'area': area,
+            'distance': float(np.linalg.norm(center - prediction)),
+            'contrast': float(np.mean(difference[component])),
+            'bbox': (
+                int(stats[label, cv.CC_STAT_LEFT]) + x0,
+                int(stats[label, cv.CC_STAT_TOP]) + y0,
+                int(stats[label, cv.CC_STAT_WIDTH]),
+                int(stats[label, cv.CC_STAT_HEIGHT]),
+            ),
+        })
+    candidates.sort(key=lambda candidate: (candidate['distance'], -candidate['contrast']))
+    return candidates, candidates[0] if candidates else None, (x0, y0, x1, y1)
+
+
+def _track_blob_range(read_frame, background, marker_data, settings):
+    """Track one camera/marker without mutating Jink marker data."""
+    marker_data = np.asarray(marker_data)
+    start, end = int(settings['start_frame']), int(settings['end_frame'])
+    mode = settings['mode']
+    explicitly_marked = marker_data[2] == 1
+
+    if mode == 'between' and not (explicitly_marked[start] and explicitly_marked[end]):
+        raise ValueError(
+            f'Between-anchor tracking requires marker {settings["marker_ind"] + 1} '
+            f'at frames {start} and {end}.'
+        )
+    seed_frame = end if mode == 'backward' else start
+    if not explicitly_marked[seed_frame]:
+        raise ValueError(
+            f'Marker {settings["marker_ind"] + 1} is not explicitly marked '
+            f'at {"end" if mode == "backward" else "start"} frame {seed_frame}.'
+        )
+    seed_position = marker_data[:2, seed_frame].astype(float)
+    if not np.all(np.isfinite(seed_position)):
+        raise ValueError(f'Marker seed at frame {seed_frame} is not finite.')
+
+    velocity = np.zeros(2, dtype=float)
+    marked_frames = np.flatnonzero(explicitly_marked).astype(int)
+    if mode == 'between':
+        velocity = (marker_data[:2, end] - marker_data[:2, start]) / float(end - start)
+    elif mode == 'forward':
+        previous = marked_frames[marked_frames < start]
+        if previous.size:
+            prior = int(previous[-1])
+            velocity = (seed_position - marker_data[:2, prior]) / float(start - prior)
+    else:
+        following = marked_frames[marked_frames > end]
+        if following.size:
+            later = int(following[0])
+            velocity = (marker_data[:2, later] - seed_position) / float(later - end)
+
+    seed_image = read_frame(seed_frame)
+    polarity = settings['target_polarity']
+    if polarity == 'auto':
+        polarity = _infer_blob_polarity(
+            seed_image, background, seed_position, settings['minimum_contrast']
+        )
+    detection_settings = dict(settings, polarity=polarity)
+    kalman = BlobKalman(seed_position, velocity)
+    sequence = range(end - 1, start - 1, -1) if mode == 'backward' else range(start + 1, end + 1)
+    timestep = -1 if mode == 'backward' else 1
+
+    results = {}
+    misses = 0
+    total_misses = 0
+    residuals = []
+    stopped_frame = None
+    for frame_ind in sequence:
+        prediction = kalman.predict(timestep)
+        if explicitly_marked[frame_ind]:
+            position = marker_data[:2, frame_ind].astype(float)
+            residuals.append((frame_ind, float(np.linalg.norm(position - prediction))))
+            kalman.correct(position)
+            misses = 0
+            continue
+
+        frame = read_frame(frame_ind)
+        candidates, accepted, _ = _detect_blob_candidates(
+            frame, background, prediction, detection_settings
+        )
+        if accepted is None:
+            misses += 1
+            total_misses += 1
+            if misses > int(settings['max_missed_frames']):
+                stopped_frame = int(frame_ind)
+                break
+            continue
+
+        results[int(frame_ind)] = accepted['position']
+        kalman.correct(accepted['position'])
+        misses = 0
+
+    return {
+        'positions': results,
+        'polarity': polarity,
+        'anchors': int(np.count_nonzero(explicitly_marked[start:end + 1])),
+        'missed': total_misses,
+        'stopped_frame': stopped_frame,
+        'residuals': residuals,
+        'end_residual': next((value for frame, value in residuals if frame == end), None),
+    }
+
+
 class TableSizeSelector(QtWidgets.QWidget):
     def __init__(self, st_win=None, parent=None):
         super().__init__()
@@ -963,7 +1148,7 @@ class Imframe():
             frame_ind = self.frame_ind
 
         # for undo
-        previous = marker_ind, frame_ind, self.data[marker_ind, :, self.frame_ind].copy()
+        previous = marker_ind, frame_ind, self.data[marker_ind, :, frame_ind].copy()
 
         if add:
             if pos is not None:
@@ -973,11 +1158,11 @@ class Imframe():
                 y = self.imview.imageItem.mapFromScene(self.mousepos).y()
                 s = 1
 
-            self.data[marker_ind, :, self.frame_ind] = [x, y, s]
+            self.data[marker_ind, :, frame_ind] = [x, y, s]
 
         # or remove the marked
         else:
-            self.data[marker_ind, -1, self.frame_ind] = 0
+            self.data[marker_ind, -1, frame_ind] = 0
 
         # set undo
         undo_call = self.set_marker, previous
@@ -986,6 +1171,7 @@ class Imframe():
         # update interp and display
         self.make_interp(marker_ind)
         self.show_markers()
+        self.parent.refresh_marker_timeline()
 
     def show_markers(self):
         '''Show markers that we have data for, or we can interpolate, or else
@@ -1837,6 +2023,209 @@ class CharucoDetectionPreview(QtWidgets.QWidget):
             )
 
 
+class MarkerFrameSlider(QtWidgets.QSlider):
+    """Native frame slider with selectable marker ticks above and below it."""
+
+    def __init__(self, st_win, parent=None):
+        super().__init__(QtCore.Qt.Orientation.Horizontal, parent)
+        self.st_win = st_win
+        self.displayed_marker = 0
+        self.selected_points = set()
+        self.annotation_camera = None
+        self.press_pos = None
+        self.drag_pos = None
+        self.dragging = False
+        self.drag_control = False
+        self.setMinimumHeight(42)
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+        self.setToolTip('Ticks above the slider are camera 1; ticks below are camera 2.')
+
+    def _style_geometry(self):
+        option = QtWidgets.QStyleOptionSlider()
+        self.initStyleOption(option)
+        groove = self.style().subControlRect(
+            QtWidgets.QStyle.ComplexControl.CC_Slider, option,
+            QtWidgets.QStyle.SubControl.SC_SliderGroove, self
+        )
+        handle = self.style().subControlRect(
+            QtWidgets.QStyle.ComplexControl.CC_Slider, option,
+            QtWidgets.QStyle.SubControl.SC_SliderHandle, self
+        )
+        slider_min = groove.x() + handle.width() / 2.
+        slider_span = max(1., groove.width() - handle.width())
+        native_top = min(groove.top(), handle.top())
+        native_bottom = max(groove.bottom(), handle.bottom())
+        return option, slider_min, slider_span, native_top, native_bottom
+
+    def _frame_x(self, frame_ind):
+        return float(self._frames_x(np.array([frame_ind], dtype=int))[0])
+
+    def _frames_x(self, frame_indices):
+        option, slider_min, slider_span, _, _ = self._style_geometry()
+        frame_indices = np.asarray(frame_indices, dtype=float)
+        value_span = self.maximum() - self.minimum()
+        if value_span <= 0:
+            return np.full(frame_indices.shape, slider_min, dtype=float)
+        positions = np.rint(
+            (frame_indices - self.minimum()) / value_span * int(round(slider_span))
+        )
+        if option.upsideDown:
+            positions = int(round(slider_span)) - positions
+        return slider_min + positions
+
+    def _camera_band(self, y):
+        _, _, _, native_top, native_bottom = self._style_geometry()
+        if y < native_top:
+            return 0
+        if y > native_bottom:
+            return 1
+        return None
+
+    def _marked_frames(self, camera_ind):
+        return np.flatnonzero(
+            self.st_win.ims[camera_ind].data[self.displayed_marker, 2] == 1
+        ).astype(int)
+
+    def set_displayed_marker(self, marker_ind):
+        self.displayed_marker = int(marker_ind)
+        self.selected_points.clear()
+        self.st_win.update_timeline_controls()
+        self.update()
+
+    def prune_selection(self):
+        valid = set()
+        for camera_ind, marker_ind, frame_ind in self.selected_points:
+            if (marker_ind == self.displayed_marker
+                    and 0 <= camera_ind < len(self.st_win.ims)
+                    and 0 <= frame_ind < self.st_win.ims[camera_ind].data.shape[-1]
+                    and self.st_win.ims[camera_ind].data[marker_ind, 2, frame_ind] == 1):
+                valid.add((camera_ind, marker_ind, frame_ind))
+        self.selected_points = valid
+
+    def _hit_test(self, camera_ind, x, tolerance=6):
+        marked = self._marked_frames(camera_ind)
+        if not marked.size:
+            return None
+        xs = self._frames_x(marked)
+        nearest = int(np.argmin(np.abs(xs - x)))
+        if abs(xs[nearest] - x) <= tolerance:
+            return camera_ind, self.displayed_marker, int(marked[nearest])
+        return None
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        self.prune_selection()
+        painter = QtGui.QPainter(self)
+        _, _, _, native_top, native_bottom = self._style_geometry()
+        tick_height = 7
+        marker_color = QtGui.QColor(*colors[self.displayed_marker])
+        for camera_ind in range(min(2, len(self.st_win.ims))):
+            marked = self._marked_frames(camera_ind)
+            x_pixels = np.unique(np.rint(self._frames_x(marked)).astype(int))
+            if camera_ind == 0:
+                y0, y1 = native_top - tick_height, native_top - 1
+            else:
+                y0, y1 = native_bottom + 1, native_bottom + tick_height
+            painter.setPen(QtGui.QPen(marker_color, 2))
+            for x in x_pixels:
+                painter.drawLine(int(x), int(y0), int(x), int(y1))
+
+        for camera_ind, marker_ind, frame_ind in self.selected_points:
+            x = self._frame_x(frame_ind)
+            if camera_ind == 0:
+                y0, y1 = native_top - tick_height, native_top - 1
+            else:
+                y0, y1 = native_bottom + 1, native_bottom + tick_height
+            painter.setPen(QtGui.QPen(self.palette().text().color(), 1))
+            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            painter.drawRect(QtCore.QRectF(x - 3, y0 - 1, 6, y1 - y0 + 2))
+
+        if self.dragging and self.press_pos is not None:
+            camera_ind = self.annotation_camera
+            current = self.drag_pos if self.drag_pos is not None else self.press_pos
+            if camera_ind == 0:
+                y0, y1 = 0, native_top - 1
+            else:
+                y0, y1 = native_bottom + 1, self.height() - 1
+            rectangle = QtCore.QRectF(
+                QtCore.QPointF(self.press_pos.x(), y0), QtCore.QPointF(current.x(), y1)
+            ).normalized()
+            painter.setPen(QtGui.QPen(self.palette().highlight().color(), 1))
+            painter.setBrush(QtGui.QColor(80, 140, 220, 45))
+            painter.drawRect(rectangle)
+
+    def mousePressEvent(self, event):
+        position = event.position() if hasattr(event, 'position') else event.localPos()
+        camera_ind = self._camera_band(position.y())
+        if event.button() != QtCore.Qt.MouseButton.LeftButton or camera_ind is None:
+            self.annotation_camera = None
+            super().mousePressEvent(event)
+            return
+        self.setFocus(QtCore.Qt.FocusReason.MouseFocusReason)
+        self.annotation_camera = camera_ind
+        self.press_pos = position
+        self.drag_pos = position
+        self.dragging = False
+        self.drag_control = bool(event.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier)
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self.annotation_camera is None or self.press_pos is None:
+            super().mouseMoveEvent(event)
+            return
+        position = event.position() if hasattr(event, 'position') else event.localPos()
+        self.drag_pos = position
+        if abs(position.x() - self.press_pos.x()) >= QtWidgets.QApplication.startDragDistance():
+            self.dragging = True
+            self.update()
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if self.annotation_camera is None or self.press_pos is None:
+            super().mouseReleaseEvent(event)
+            return
+        position = event.position() if hasattr(event, 'position') else event.localPos()
+        camera_ind = self.annotation_camera
+        if self.dragging:
+            x0, x1 = sorted((self.press_pos.x(), position.x()))
+            hits = {
+                (camera_ind, self.displayed_marker, int(frame))
+                for frame in self._marked_frames(camera_ind)
+                if x0 <= self._frame_x(frame) <= x1
+            }
+            if self.drag_control:
+                self.selected_points.update(hits)
+            else:
+                self.selected_points = hits
+        else:
+            hit = self._hit_test(camera_ind, position.x())
+            if hit is None:
+                self.selected_points.clear()
+            elif self.drag_control:
+                if hit in self.selected_points:
+                    self.selected_points.remove(hit)
+                else:
+                    self.selected_points.add(hit)
+                self.setValue(hit[2])
+            else:
+                self.selected_points = {hit}
+                self.setValue(hit[2])
+        self.annotation_camera = None
+        self.press_pos = None
+        self.drag_pos = None
+        self.dragging = False
+        self.st_win.update_timeline_controls()
+        self.update()
+        event.accept()
+
+    def keyPressEvent(self, event):
+        if event.key() == QtCore.Qt.Key.Key_Delete and self.selected_points:
+            self.st_win.delete_selected_marker_points()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class BoardCalibrationDialog(QtWidgets.QDialog):
     """Collect board-calibration settings and test ChArUco detections."""
 
@@ -2519,6 +2908,212 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
         return QtGui.QPixmap.fromImage(qimage)
 
 
+#######################
+### Tracking dialog ###
+#######################
+
+class TrackingDialog(QtWidgets.QDialog):
+    """Settings and one-frame preview for conservative blob tracking."""
+
+    def __init__(self, st_win, parent=None):
+        super().__init__(parent)
+        self.st_win = st_win
+        self.qsettings = QtCore.QSettings('TheobaldLab', 'Jink3D')
+        self.background_cache = {}
+        self.setWindowTitle('Automatic tracking')
+        self.setModal(True)
+        self.setMinimumWidth(850)
+
+        outer = QtWidgets.QHBoxLayout(self)
+        controls = QtWidgets.QVBoxLayout()
+        outer.addLayout(controls, 0)
+        form = QtWidgets.QFormLayout()
+        controls.addLayout(form)
+
+        self.method = QtWidgets.QComboBox()
+        self.method.addItem('Background-subtracted blob + Kalman', 'blob_kalman')
+        form.addRow('Method:', self.method)
+
+        self.marker = QtWidgets.QSpinBox()
+        self.marker.setRange(1, max(1, int(st_win.num_markers)))
+        self.marker.setValue(int(np.clip(st_win.curr_marker + 1, 1, st_win.num_markers)))
+        form.addRow('Marker:', self.marker)
+
+        self.camera = QtWidgets.QComboBox()
+        for camera_ind, im in enumerate(st_win.ims):
+            name = os.path.basename(im.fn) if getattr(im, 'fn', '') else 'no video loaded'
+            self.camera.addItem(f'Camera {camera_ind + 1}: {name}', camera_ind)
+        self.camera.addItem('Both cameras', 'both')
+        form.addRow('Camera:', self.camera)
+
+        self.mode = QtWidgets.QComboBox()
+        self.mode.addItem('Between anchors', 'between')
+        self.mode.addItem('Forward', 'forward')
+        self.mode.addItem('Backward', 'backward')
+        self._set_combo(self.mode, self.qsettings.value('tracking/mode', 'between'))
+        form.addRow('Mode:', self.mode)
+
+        max_frame = max(1, int(getattr(st_win, 'num_frames', 1)) - 1)
+        self.start_frame = QtWidgets.QSpinBox()
+        self.end_frame = QtWidgets.QSpinBox()
+        self.start_frame.setRange(0, max_frame - 1)
+        self.end_frame.setRange(1, max_frame)
+        form.addRow('Start frame:', self.start_frame)
+        form.addRow('End frame:', self.end_frame)
+
+        self.target = QtWidgets.QComboBox()
+        self.target.addItem('Auto', 'auto')
+        self.target.addItem('Dark blob', 'dark')
+        self.target.addItem('Light blob', 'light')
+        self._set_combo(self.target, self.qsettings.value('tracking/target_polarity', 'auto'))
+        form.addRow('Target:', self.target)
+
+        self.search_radius = self._spin(2, 1000, 'tracking/search_radius', 40)
+        self.minimum_contrast = self._spin(1, 255, 'tracking/minimum_contrast', 15)
+        self.min_blob_area = self._spin(1, 1000000, 'tracking/min_blob_area', 3)
+        self.max_blob_area = self._spin(1, 1000000, 'tracking/max_blob_area', 5000)
+        self.background_samples = self._spin(3, 201, 'tracking/background_samples', 31)
+        self.max_missed_frames = self._spin(0, 1000, 'tracking/max_missed_frames', 2)
+        form.addRow('Search radius (pixels):', self.search_radius)
+        form.addRow('Minimum contrast:', self.minimum_contrast)
+        form.addRow('Minimum blob area:', self.min_blob_area)
+        form.addRow('Maximum blob area:', self.max_blob_area)
+        form.addRow('Background samples:', self.background_samples)
+        form.addRow('Maximum missed frames:', self.max_missed_frames)
+
+        self.note = QtWidgets.QLabel('Test previews one frame without changing marker data.')
+        self.note.setWordWrap(True)
+        controls.addWidget(self.note)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Cancel)
+        self.test_button = buttons.addButton('Test', QtWidgets.QDialogButtonBox.ActionRole)
+        self.run_button = buttons.addButton('Run', QtWidgets.QDialogButtonBox.AcceptRole)
+        self.test_button.clicked.connect(self._test)
+        self.run_button.clicked.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        controls.addWidget(buttons)
+
+        preview = QtWidgets.QVBoxLayout()
+        outer.addLayout(preview, 1)
+        self.preview_summary = QtWidgets.QLabel('Click Test to preview blob detection.')
+        self.preview_summary.setWordWrap(True)
+        preview.addWidget(self.preview_summary)
+        self.preview_images = []
+        for _ in range(2):
+            label = QtWidgets.QLabel()
+            label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            label.setMinimumSize(400, 260)
+            label.setFrameShape(QtWidgets.QFrame.Shape.Box)
+            label.hide()
+            preview.addWidget(label)
+            self.preview_images.append(label)
+
+        self.marker.valueChanged.connect(self._set_default_range)
+        self.camera.currentIndexChanged.connect(self._set_default_range)
+        self._set_default_range()
+
+    def _spin(self, minimum, maximum, key, default):
+        spin = QtWidgets.QSpinBox()
+        spin.setRange(minimum, maximum)
+        try:
+            value = int(self.qsettings.value(key, default))
+        except (TypeError, ValueError):
+            value = default
+        spin.setValue(int(np.clip(value, minimum, maximum)))
+        return spin
+
+    def _set_combo(self, combo, value):
+        for index in range(combo.count()):
+            if str(combo.itemData(index)) == str(value):
+                combo.setCurrentIndex(index)
+                return
+
+    def _selected_default_camera(self):
+        camera = self.camera.currentData()
+        return 0 if camera == 'both' else int(camera)
+
+    def _set_default_range(self):
+        max_frame = max(1, int(getattr(self.st_win, 'num_frames', 1)) - 1)
+        current = int(np.clip(self.st_win.frame_slider.value(), 0, max_frame))
+        camera_ind = self._selected_default_camera()
+        marker_ind = self.marker.value() - 1
+        marked = np.flatnonzero(self.st_win.ims[camera_ind].data[marker_ind, 2] == 1)
+        before = marked[marked < current]
+        after = marked[marked > current]
+        if before.size and after.size:
+            start, end = int(before[-1]), int(after[0])
+        elif current in marked and after.size:
+            start, end = current, int(after[0])
+        elif current in marked and before.size:
+            start, end = int(before[-1]), current
+        else:
+            start, end = max(0, current - 5), min(max_frame, current + 5)
+            if start == end:
+                start, end = max(0, end - 1), min(max_frame, start + 1)
+        self.start_frame.setValue(start)
+        self.end_frame.setValue(end)
+
+    def settings(self):
+        return {
+            'method': self.method.currentData(),
+            'marker_ind': int(self.marker.value()) - 1,
+            'camera': self.camera.currentData(),
+            'mode': self.mode.currentData(),
+            'start_frame': int(self.start_frame.value()),
+            'end_frame': int(self.end_frame.value()),
+            'target_polarity': self.target.currentData(),
+            'search_radius': int(self.search_radius.value()),
+            'minimum_contrast': int(self.minimum_contrast.value()),
+            'min_blob_area': int(self.min_blob_area.value()),
+            'max_blob_area': int(self.max_blob_area.value()),
+            'background_samples': int(self.background_samples.value()),
+            'max_missed_frames': int(self.max_missed_frames.value()),
+        }
+
+    def _save_settings(self):
+        settings = self.settings()
+        for key in ('method', 'mode', 'target_polarity', 'search_radius',
+                    'minimum_contrast', 'min_blob_area', 'max_blob_area',
+                    'background_samples', 'max_missed_frames'):
+            self.qsettings.setValue(f'tracking/{key}', settings[key])
+
+    def _test(self):
+        try:
+            results = self.st_win.test_blob_tracking(self.settings(), self.background_cache)
+        except Exception as error:
+            self.preview_summary.setText(str(error))
+            return
+        summaries = []
+        for label in self.preview_images:
+            label.clear()
+            label.hide()
+        for result, label in zip(results, self.preview_images):
+            summaries.append(result['summary'])
+            rgb = cv.cvtColor(result['image'], cv.COLOR_BGR2RGB)
+            rgb = np.ascontiguousarray(rgb)
+            height, width, channels = rgb.shape
+            qimage = QtGui.QImage(
+                rgb.data, width, height, channels * width, QtGui.QImage.Format_RGB888
+            ).copy()
+            pixmap = QtGui.QPixmap.fromImage(qimage)
+            label.setPixmap(pixmap.scaled(
+                label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
+            ))
+            label.show()
+        self.preview_summary.setText('\n'.join(summaries))
+
+    def accept(self):
+        settings = self.settings()
+        if settings['start_frame'] >= settings['end_frame']:
+            self.note.setText('Start frame must be less than end frame.')
+            return
+        if settings['min_blob_area'] > settings['max_blob_area']:
+            self.note.setText('Minimum blob area must not exceed maximum blob area.')
+            return
+        self._save_settings()
+        super().accept()
+
+
 ###############################
 ### Orientation calibration dialog
 ###############################
@@ -2788,6 +3383,12 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         nav_menu.addSeparator()
         nav_menu.addActions([next_frame_mar, prev_frame_mar, next_frame_mid, prev_frame_mid])
 
+        # tracking menu
+        tracking_menu = menubar.addMenu('Tracking')
+        auto_tracking_action = QtWidgets.QAction('Auto tracking...', self)
+        auto_tracking_action.triggered.connect(self.open_tracking_dialog)
+        tracking_menu.addAction(auto_tracking_action)
+
         #  calibration menu
         cal_menu = menubar.addMenu('Calibration')
 
@@ -2851,10 +3452,28 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         self.setCentralWidget(w)
 
         ### top row
+        self.frame_vbox = QtWidgets.QVBoxLayout()
+        self.frame_vbox.setSpacing(1)
+        marker_controls = QtWidgets.QHBoxLayout()
+        marker_controls.addWidget(QtWidgets.QLabel('Marker marks:'))
+        self.timeline_marker_selector = QtWidgets.QComboBox()
+        for marker_ind in range(self.num_markers):
+            self.timeline_marker_selector.addItem(str(marker_ind + 1), marker_ind)
+        marker_controls.addWidget(self.timeline_marker_selector)
+        marker_controls.addWidget(QtWidgets.QLabel('ticks above: camera 1   below: camera 2'))
+        marker_controls.addStretch(1)
+        self.timeline_selection_label = QtWidgets.QLabel('0 selected')
+        marker_controls.addWidget(self.timeline_selection_label)
+        self.timeline_delete_button = QtWidgets.QPushButton('Delete')
+        self.timeline_delete_button.setEnabled(False)
+        self.timeline_delete_button.clicked.connect(self.delete_selected_marker_points)
+        marker_controls.addWidget(self.timeline_delete_button)
+        self.frame_vbox.addLayout(marker_controls)
+
         self.frame_hbox = QtWidgets.QHBoxLayout()
 
         # frame slider
-        self.frame_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.frame_slider = MarkerFrameSlider(self)
         self.frame_slider.setMinimum(0)
         self.frame_slider.setMaximum(0)
         self.frame_slider.valueChanged.connect(self.change_frame)
@@ -2862,6 +3481,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         self.frame_value = QtWidgets.QLabel('0/0')
         self.frame_hbox.addWidget(self.frame_slider)
         self.frame_hbox.addWidget(self.frame_value)
+        self.frame_vbox.addLayout(self.frame_hbox)
 
         ### middle row
         self.images_hbox = QtWidgets.QHBoxLayout()
@@ -2895,9 +3515,9 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         self.tab = QtWidgets.QLabel('')
         self.tab.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignLeft)
         self.tab.setFont(QtGui.QFont('Monospace', 12))
-        self.tab.setWordWrap(True)
-        self.tab.setMinimumWidth(300)
-        self.tab.setMaximumWidth(310)
+        self.tab.setWordWrap(False)
+        self.tab.setMinimumWidth(380)
+        self.tab.setMaximumWidth(420)
         vbox.addWidget(self.tab)
         self.update_table()
         self.three_d_hbox.addItem(vbox)
@@ -2921,12 +3541,13 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         vbox.addLayout(hindicators)
 
         ### set the layout
-        self.layout.addLayout(self.frame_hbox)
+        self.layout.addLayout(self.frame_vbox)
         self.layout.addLayout(self.images_hbox)
         self.layout.addLayout(self.three_d_hbox)
 
         ### now the markers
         self.num_frames = 1  # until we load a dir
+        self.timeline_marker_selector.currentIndexChanged.connect(self.set_timeline_marker)
         self.marker_keys = [QtCore.Qt.Key.Key_1, QtCore.Qt.Key.Key_2, QtCore.Qt.Key.Key_3, QtCore.Qt.Key.Key_4,
                             QtCore.Qt.Key.Key_5, QtCore.Qt.Key.Key_6, QtCore.Qt.Key.Key_7, QtCore.Qt.Key.Key_8,
                             QtCore.Qt.Key.Key_9]
@@ -3075,6 +3696,10 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
             im.set_frame(0, True, True)
             im.show_markers()
 
+        timeline_marker = int(np.clip(self.curr_marker, 0, self.num_markers - 1))
+        self.timeline_marker_selector.setCurrentIndex(timeline_marker)
+        self.frame_slider.set_displayed_marker(timeline_marker)
+        self.refresh_marker_timeline(clear_selection=True)
         self.console_write(f'{self.fns[0]}\n{self.fns[1]}', 'loaded AVIs')
 
     def set_chessboard_size(self, board_rows, board_cols):
@@ -3140,6 +3765,206 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
                 'This board type is not implemented in the dialog yet.',
                 'board calibration'
             )
+
+    def open_tracking_dialog(self):
+        """Open settings, then run background-subtracted blob tracking."""
+        if len(self.ims) != 2 or not all(getattr(im, 'fn', '') for im in self.ims):
+            self.console_write('Need loaded videos before automatic tracking.', 'Blob tracking failed')
+            return
+        dialog = TrackingDialog(self, self)
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        self.run_blob_tracking(dialog.settings(), dialog.background_cache)
+
+    def _tracking_camera_indices(self, settings):
+        camera = settings['camera']
+        return [0, 1] if camera == 'both' else [int(camera)]
+
+    def _read_tracking_frame(self, camera_ind, frame_ind):
+        im = self.ims[camera_ind]
+        im.cap.set(cv.CAP_PROP_POS_FRAMES, int(frame_ind))
+        ok, frame = im.cap.read()
+        if not ok or frame is None:
+            raise ValueError(
+                f'Could not read frame {frame_ind} from {os.path.basename(im.fn)}.'
+            )
+        return cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+
+    def _build_tracking_background(self, camera_ind, settings, cache=None):
+        key = (
+            camera_ind, settings['start_frame'], settings['end_frame'],
+            settings['background_samples']
+        )
+        if cache is not None and key in cache:
+            return cache[key]
+        frame_count = settings['end_frame'] - settings['start_frame'] + 1
+        sample_count = min(int(settings['background_samples']), frame_count)
+        sample_frames = np.unique(np.linspace(
+            settings['start_frame'], settings['end_frame'], sample_count, dtype=int
+        ))
+        images = [self._read_tracking_frame(camera_ind, frame) for frame in sample_frames]
+        if not images or any(image.shape != images[0].shape for image in images):
+            raise ValueError('Could not compute a consistent median tracking background.')
+        background = np.median(np.stack(images), axis=0).astype(np.uint8)
+        if cache is not None:
+            cache[key] = background
+        return background
+
+    def _validate_tracking_settings(self, settings, camera_indices):
+        start, end = settings['start_frame'], settings['end_frame']
+        if len(self.ims) != 2 or not all(getattr(im, 'fn', '') for im in self.ims):
+            raise ValueError('Need loaded videos before automatic tracking.')
+        if start >= end:
+            raise ValueError('Start frame must be less than end frame.')
+        if settings['min_blob_area'] > settings['max_blob_area']:
+            raise ValueError('Minimum blob area must not exceed maximum blob area.')
+        marker_ind = int(settings['marker_ind'])
+        if marker_ind < 0 or marker_ind >= self.num_markers:
+            raise ValueError(f'Marker {marker_ind + 1} is outside the available marker range.')
+        for camera_ind in camera_indices:
+            im = self.ims[camera_ind]
+            if start < 0 or end >= im.num_frames:
+                raise ValueError(
+                    f'Frame range {start}-{end} is outside {os.path.basename(im.fn)}.'
+                )
+            marked = im.data[marker_ind, 2] == 1
+            if settings['mode'] == 'between' and not (marked[start] and marked[end]):
+                raise ValueError(
+                    f'Between-anchor tracking requires marker {marker_ind + 1} '
+                    f'at frames {start} and {end} in {os.path.basename(im.fn)}.'
+                )
+            seed = end if settings['mode'] == 'backward' else start
+            if not marked[seed]:
+                raise ValueError(
+                    f'Marker {marker_ind + 1} is not explicitly marked at '
+                    f'{"end" if settings["mode"] == "backward" else "start"} '
+                    f'frame {seed} in {os.path.basename(im.fn)}.'
+                )
+            if not np.all(np.isfinite(im.data[marker_ind, :2, seed])):
+                raise ValueError(f'Marker seed at frame {seed} is not finite.')
+
+    def test_blob_tracking(self, settings, cache=None):
+        """Return annotated one-frame previews without modifying marker data."""
+        camera_indices = self._tracking_camera_indices(settings)
+        self._validate_tracking_settings(settings, camera_indices)
+        current_frame = int(self.frame_slider.value())
+        previews = []
+        try:
+            for camera_ind in camera_indices:
+                im = self.ims[camera_ind]
+                marker = im.data[settings['marker_ind']]
+                background = self._build_tracking_background(camera_ind, settings, cache)
+                if (settings['start_frame'] <= current_frame <= settings['end_frame']
+                        and marker[2, current_frame] == 1):
+                    frame_ind = current_frame
+                else:
+                    frame_ind = settings['end_frame'] if settings['mode'] == 'backward' else settings['start_frame']
+                prediction = marker[:2, frame_ind].astype(float)
+                frame = self._read_tracking_frame(camera_ind, frame_ind)
+                polarity = settings['target_polarity']
+                if polarity == 'auto':
+                    polarity = _infer_blob_polarity(
+                        frame, background, prediction, settings['minimum_contrast']
+                    )
+                detection_settings = dict(settings, polarity=polarity)
+                candidates, accepted, roi = _detect_blob_candidates(
+                    frame, background, prediction, detection_settings
+                )
+                annotated = cv.cvtColor(frame, cv.COLOR_GRAY2BGR)
+                x0, y0, x1, y1 = roi
+                cv.rectangle(annotated, (x0, y0), (max(x0, x1 - 1), max(y0, y1 - 1)), (255, 170, 0), 1)
+                cv.drawMarker(annotated, tuple(np.rint(prediction).astype(int)), (0, 255, 255),
+                              cv.MARKER_CROSS, 12, 2)
+                for candidate in candidates:
+                    cv.circle(annotated, tuple(np.rint(candidate['position']).astype(int)), 4, (0, 165, 255), 1)
+                if accepted is None:
+                    detail = 'no acceptable candidate'
+                else:
+                    bx, by, bw, bh = accepted['bbox']
+                    cv.rectangle(annotated, (bx, by), (bx + bw - 1, by + bh - 1), (0, 255, 0), 2)
+                    detail = (
+                        f"accepted area: {accepted['area']} px; "
+                        f"distance: {accepted['distance']:.1f} px"
+                    )
+                previews.append({
+                    'image': annotated,
+                    'summary': (
+                        f'Camera {camera_ind + 1}, frame {frame_ind}: polarity: {polarity}; '
+                        f'candidates: {len(candidates)}; {detail}'
+                    )
+                })
+        finally:
+            self.change_frame(current_frame)
+        return previews
+
+    def _apply_blob_tracking_results(self, camera_ind, marker_ind, positions):
+        """Store automatic results using today's ordinary marked-point state."""
+        marker = self.ims[camera_ind].data[marker_ind]
+        for frame_ind, position in positions.items():
+            marker[0, frame_ind], marker[1, frame_ind] = position
+            marker[2, frame_ind] = 1
+
+    def run_blob_tracking(self, settings, cache=None):
+        """Validate, track selected cameras independently, then apply results."""
+        current_frame = int(self.frame_slider.value())
+        camera_indices = self._tracking_camera_indices(settings)
+        try:
+            self._validate_tracking_settings(settings, camera_indices)
+            backgrounds = {
+                camera_ind: self._build_tracking_background(camera_ind, settings, cache)
+                for camera_ind in camera_indices
+            }
+            runs = {}
+            for camera_ind in camera_indices:
+                read_frame = lambda frame, camera=camera_ind: self._read_tracking_frame(camera, frame)
+                runs[camera_ind] = _track_blob_range(
+                    read_frame,
+                    backgrounds[camera_ind],
+                    self.ims[camera_ind].data[settings['marker_ind']],
+                    settings
+                )
+
+            for camera_ind, result in runs.items():
+                self._apply_blob_tracking_results(
+                    camera_ind, settings['marker_ind'], result['positions']
+                )
+            self.camera_to_3d(settings['marker_ind'])
+
+            for camera_ind, result in runs.items():
+                residual_values = [value for _, value in result['residuals']]
+                stopped = (
+                    f"lost after consecutive misses at frame {result['stopped_frame']}"
+                    if result['stopped_frame'] is not None else 'completed range'
+                )
+                lines = [
+                    f'marker: {settings["marker_ind"] + 1}',
+                    f'camera: {os.path.basename(self.ims[camera_ind].fn)}',
+                    f'mode: {settings["mode"]}',
+                    f'frames requested: {settings["start_frame"]}-{settings["end_frame"]}',
+                    f'target polarity: {result["polarity"]}',
+                    '',
+                    f'existing anchors preserved: {result["anchors"]}',
+                    f'new blob positions: {len(result["positions"])}',
+                    f'missed frames: {result["missed"]}',
+                    f'tracking stopped: {stopped}',
+                ]
+                if residual_values:
+                    lines.extend([
+                        '',
+                        f'anchor residual mean: {np.mean(residual_values):.1f} px',
+                        f'anchor residual max: {np.max(residual_values):.1f} px',
+                    ])
+                if result['end_residual'] is not None:
+                    lines.append(f'end anchor residual: {result["end_residual"]:.1f} px')
+                lines.extend([
+                    '',
+                    'Automatic positions are currently stored as ordinary Jink marked points.'
+                ])
+                self.console_write('\n'.join(lines), 'Blob tracking')
+        except Exception as error:
+            self.console_write(str(error), 'Blob tracking failed')
+        finally:
+            self.change_frame(current_frame)
 
     def open_orientation_dialog(self):
         """Open the orientation of gravity calibration dialog."""
@@ -3237,6 +4062,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
             self.console_write(f"Checkerboard stereo calibration failed: {e}", "calibration")
             return
 
+        self.rebuild_3d()
         self.console_write(f'frames: {self.td.cal_inds}\nroot mean squared error = {self.td.rmse}', 'calibration')
 
     def get_circle_grid(self, settings=None):
@@ -3299,6 +4125,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
             self.console_write(f"Circle-grid stereo calibration failed: {e}", "calibration")
             return
 
+        self.rebuild_3d()
         self.console_write(
             f'frames: {self.td.cal_inds}\nroot mean squared error = {self.td.rmse}',
             'calibration'
@@ -3353,6 +4180,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
             self.console_write(f"ChArUco stereo calibration failed: {e}", "calibration")
             return
 
+        self.rebuild_3d()
         self.console_write(
             f'frames: {self.td.cal_inds}\nroot mean squared error = {self.td.rmse}',
             'calibration'
@@ -3405,17 +4233,80 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         '''Make a table of valid marker values.
 
         '''
-        text = ['<pre>M:   x       y       z</pre>']
+        text = ['<pre>M:       x       y       z</pre>']
         frame_ind = int(self.frame_slider.value())
         for marker_ind in range(self.num_markers):
             if frame_ind in self.td.get_valid_inds(marker_ind):
                 x, y, z = self.td.data[marker_ind, :, frame_ind]
                 r, g, b = colors[marker_ind]
-                t = f"<pre style='color: rgb({r}, {g}, {b});'>{marker_ind + 1}: {x:7.01f} {y:7.01f} {z:7.01f}</pre>"
+                explicit = [
+                    bool(im.data[marker_ind, 2, frame_ind] == 1)
+                    for im in self.ims
+                ]
+                status = ''.join('●' if marked else '○' for marked in explicit)
+                weight = ' font-weight: bold;' if all(explicit) else ''
+                t = (
+                    f"<pre style='color: rgb({r}, {g}, {b});{weight}'>"
+                    f'{marker_ind + 1} {status} {x:7.01f} {y:7.01f} {z:7.01f}</pre>'
+                )
                 text.append(t)
                 # self.t = t
 
         self.tab.setText('\n'.join(text))
+
+    def set_timeline_marker(self, combo_index):
+        '''Change only the marker shown on the frame slider.'''
+        marker_ind = self.timeline_marker_selector.itemData(int(combo_index))
+        self.frame_slider.set_displayed_marker(marker_ind)
+
+    def update_timeline_controls(self):
+        '''Prune stale selections and refresh slider selection controls.'''
+        if not isinstance(getattr(self, 'frame_slider', None), MarkerFrameSlider):
+            return
+        self.frame_slider.prune_selection()
+        count = len(self.frame_slider.selected_points)
+        self.timeline_selection_label.setText(f'{count} selected')
+        self.timeline_delete_button.setEnabled(count > 0)
+        self.frame_slider.update()
+
+    def refresh_marker_timeline(self, clear_selection=False):
+        if not isinstance(getattr(self, 'frame_slider', None), MarkerFrameSlider):
+            return
+        if clear_selection:
+            self.frame_slider.selected_points.clear()
+        self.update_timeline_controls()
+
+    def delete_selected_marker_points(self):
+        '''Delete exactly the selected camera/marker/frame observations.'''
+        selected = sorted(self.frame_slider.selected_points)
+        states = []
+        affected_markers = set()
+        for camera_ind, marker_ind, frame_ind in selected:
+            im = self.ims[camera_ind]
+            if im.data[marker_ind, 2, frame_ind] != 1:
+                continue
+            states.append((camera_ind, marker_ind, frame_ind,
+                           im.data[marker_ind, :, frame_ind].copy()))
+            im.data[marker_ind, 2, frame_ind] = 0
+            affected_markers.add(marker_ind)
+        if not states:
+            self.refresh_marker_timeline(clear_selection=True)
+            return
+
+        self.undo_list.append((self.restore_deleted_marker_points, (states,)))
+        self.frame_slider.selected_points.clear()
+        self._refresh_changed_markers(affected_markers)
+
+    def restore_deleted_marker_points(self, states):
+        '''Restore one grouped timeline deletion without creating undo entries.'''
+        for camera_ind, marker_ind, frame_ind, value in states:
+            self.ims[camera_ind].data[marker_ind, :, frame_ind] = value
+
+    def _refresh_changed_markers(self, marker_indices):
+        for marker_ind in sorted(marker_indices):
+            self.camera_to_3d(marker_ind)
+        self.change_frame(int(self.frame_slider.value()))
+        self.refresh_marker_timeline()
 
     def change_frame(self, frame_ind=None, autorange=False, autolevel=False):
         '''Changes to a new frame in the avi by updating the images, 3d view,
@@ -3432,6 +4323,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         self.td.set_frame(frame_ind)
 
         self.update_table()
+        self.refresh_marker_timeline()
 
     def reset_view(self):
         '''Reset the view. In an imframe this resets scaling and brightness
@@ -3670,6 +4562,12 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         function it pairs to
 
         '''
+        if (event.key() == QtCore.Qt.Key.Key_Delete
+                and isinstance(getattr(self, 'frame_slider', None), MarkerFrameSlider)
+                and self.frame_slider.selected_points):
+            self.delete_selected_marker_points()
+            event.accept()
+            return
         # first check if the mouse is over the console:
         self.key_event = event
         dictkey = self.get_keystroke()
@@ -3714,15 +4612,24 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
             self.move_frame_slider(advance)
 
     def camera_to_3d(self, marker_ind):
-        '''Redo the interpolation for a marker, and if there is a calibration
-        file, update the 3D display data as well
+        '''Redo the interpolation for a marker, and if camera geometry is
+        available, update the 3D display data as well.
 
         '''
         for im in self.ims:
             im.make_interp(marker_ind)
-        if self.chk_calibration != 'None':
+        if self.td.got_cal:
             self.td.update_data(marker_ind)
             self.td.show_lines()
+
+    def rebuild_3d(self):
+        if not self.td.got_cal:
+            return
+
+        for marker_ind in range(self.num_markers):
+            self.camera_to_3d(marker_ind)
+
+        self.change_frame(int(self.frame_slider.value()))
 
     def save_data_as(self):
         '''Save the marker and 3d data with a dialog to get the filename.
@@ -3864,6 +4771,8 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
             for marker_ind in range(self.num_markers):
                 self.camera_to_3d(marker_ind)
 
+            self.refresh_marker_timeline(clear_selection=True)
+            self.change_frame(int(self.frame_slider.value()))
             self.console_write(fn, 'loaded marker data')
 
     def import_deeplabcut_h5(self):
@@ -3941,6 +4850,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         self.data_fn = ''
         self.get_data_fn = False
         self.undo_list = []
+        self.refresh_marker_timeline(clear_selection=True)
 
         self.change_frame(int(self.frame_slider.value()))
 
@@ -4071,6 +4981,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         self.td.set_camera_markers()
 
         self.set_calibration_indicator('chk', fn=fn)
+        self.rebuild_3d()
 
         self.console_write(fn, f'loaded camera geometry')
 
@@ -4095,6 +5006,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         self.td.got_pb = True
 
         self.set_calibration_indicator('pb', fn=fn)
+        self.rebuild_3d()
 
         self.console_write(fn, f'loaded orientation')
 
@@ -4148,14 +5060,19 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         if len(self.undo_list) > 0:
             # get last state and execute the command to retrieve it
             fun, args = self.undo_list.pop()
+            previous_length = len(self.undo_list)
             fun(*args)
 
-            # purge the new last state (what we just undid)
-            self.undo_list.pop()
+            # Legacy set_marker undo calls add one inverse entry. Grouped
+            # timeline restoration does not, so only discard one when added.
+            if len(self.undo_list) > previous_length:
+                self.undo_list.pop()
 
         # update the 3d plots as if a marker moved
         for marker_ind in range(self.num_markers):
             self.camera_to_3d(marker_ind)
+        self.change_frame(int(self.frame_slider.value()))
+        self.refresh_marker_timeline()
 
     def toggle_fullscreen(self):
         if self.fullscreen:

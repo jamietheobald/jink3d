@@ -203,32 +203,81 @@ class BlobKalman:
 
 
 def _infer_blob_polarity(frame, background, position, minimum_contrast):
-    """Infer light/dark target polarity from a small patch at a seed point."""
+    """Infer light/dark target polarity robustly from the marked seed patch."""
+    analysis = _analyze_blob_seed(frame, background, position)
+    return analysis['polarity']
+
+
+def _analyze_blob_seed(frame, background, position):
+    """Estimate raw-image polarity, contrast, noise, and blob area at a seed."""
+    frame = np.asarray(frame)
+    background = np.asarray(background)
+    if frame.shape != background.shape or frame.ndim != 2:
+        raise ValueError('Seed analysis requires matching grayscale frame and background images.')
     x, y = np.rint(position).astype(int)
-    radius = 2
-    y0, y1 = max(0, y - radius), min(frame.shape[0], y + radius + 1)
-    x0, x1 = max(0, x - radius), min(frame.shape[1], x + radius + 1)
-    if x0 >= x1 or y0 >= y1:
+    if not (0 <= x < frame.shape[1] and 0 <= y < frame.shape[0]):
         raise ValueError('Seed position lies outside the video frame.')
-    signed_contrast = float(np.mean(
-        frame[y0:y1, x0:x1].astype(float) - background[y0:y1, x0:x1].astype(float)
-    ))
-    required = max(2., float(minimum_contrast) * .25)
-    if not np.isfinite(signed_contrast) or abs(signed_contrast) < required:
+
+    residual = frame.astype(np.float32) - background.astype(np.float32)
+    yy, xx = np.ogrid[:frame.shape[0], :frame.shape[1]]
+    distance2 = (xx - x) ** 2 + (yy - y) ** 2
+    target_values = residual[distance2 <= 3 ** 2]
+    noise_values = residual[(distance2 >= 6 ** 2) & (distance2 <= 14 ** 2)]
+    if target_values.size == 0 or noise_values.size < 8:
+        raise ValueError('Seed is too close to the image boundary for reliable analysis.')
+
+    noise_median = float(np.median(noise_values))
+    dark_contrast = float(np.percentile(target_values, 25) - noise_median)
+    light_contrast = float(np.percentile(target_values, 75) - noise_median)
+    signed_contrast = light_contrast if abs(light_contrast) >= abs(dark_contrast) else dark_contrast
+    noise = float(1.4826 * np.median(np.abs(noise_values - noise_median)))
+    if not np.isfinite(signed_contrast) or abs(signed_contrast) < max(1., 1.5 * noise):
         raise ValueError(
-            'Could not determine whether the target is lighter or darker than the background.'
+            'Could not determine target polarity: seed contrast is too small relative to local noise.'
         )
-    return 'light' if signed_contrast > 0 else 'dark'
+    polarity = 'light' if signed_contrast > 0 else 'dark'
+    contrast = abs(signed_contrast)
+    threshold = int(np.clip(round(max(2.0 * noise, 0.35 * contrast)), 1, 255))
+    if contrast > 1:
+        threshold = min(threshold, max(1, int(np.floor(0.8 * contrast))))
+
+    signed = residual if polarity == 'light' else -residual
+    local_radius = 20
+    x0, x1 = max(0, x - local_radius), min(frame.shape[1], x + local_radius + 1)
+    y0, y1 = max(0, y - local_radius), min(frame.shape[0], y + local_radius + 1)
+    local = (signed[y0:y1, x0:x1] >= max(1., min(threshold, 0.5 * contrast))).astype(np.uint8)
+    count, labels, stats, centroids = cv.connectedComponentsWithStats(local, connectivity=8)
+    area = None
+    best_distance = np.inf
+    for label in range(1, count):
+        cx, cy = centroids[label]
+        distance = np.hypot(cx + x0 - x, cy + y0 - y)
+        if distance < best_distance and distance <= 5:
+            best_distance = distance
+            area = int(stats[label, cv.CC_STAT_AREA])
+    if area is None:
+        raise ValueError('Could not estimate a connected blob around the marked seed.')
+
+    return {
+        'polarity': polarity,
+        'contrast': contrast,
+        'noise': noise,
+        'estimated_area': area,
+        'suggested_contrast': threshold,
+        'suggested_min_area': max(1, int(np.floor(area * .25))),
+        'suggested_max_area': max(2, int(np.ceil(area * 4.0))),
+    }
 
 
-def _detect_blob_candidates(frame, background, prediction, settings):
+def _detect_blob_candidates(frame, background, prediction, settings, return_diagnostics=False):
     """Detect area-filtered blobs in a prediction-centered local ROI."""
     radius = int(settings['search_radius'])
     x, y = np.rint(prediction).astype(int)
     x0, x1 = max(0, x - radius), min(frame.shape[1], x + radius + 1)
     y0, y1 = max(0, y - radius), min(frame.shape[0], y + radius + 1)
     if x0 >= x1 or y0 >= y1:
-        return [], None, (x0, y0, x1, y1)
+        result = ([], None, (x0, y0, x1, y1))
+        return (*result, {'reason': 'prediction outside image'}) if return_diagnostics else result
 
     frame_roi = frame[y0:y1, x0:x1].astype(np.int16)
     background_roi = background[y0:y1, x0:x1].astype(np.int16)
@@ -240,9 +289,15 @@ def _detect_blob_candidates(frame, background, prediction, settings):
     count, labels, stats, centroids = cv.connectedComponentsWithStats(mask, connectivity=8)
 
     candidates = []
+    below_area = 0
+    above_area = 0
     for label in range(1, count):
         area = int(stats[label, cv.CC_STAT_AREA])
-        if area < int(settings['min_blob_area']) or area > int(settings['max_blob_area']):
+        if area < int(settings['min_blob_area']):
+            below_area += 1
+            continue
+        if area > int(settings['max_blob_area']):
+            above_area += 1
             continue
         cx, cy = centroids[label]
         center = np.array([cx + x0, cy + y0], dtype=float)
@@ -260,7 +315,26 @@ def _detect_blob_candidates(frame, background, prediction, settings):
             ),
         })
     candidates.sort(key=lambda candidate: (candidate['distance'], -candidate['contrast']))
-    return candidates, candidates[0] if candidates else None, (x0, y0, x1, y1)
+    accepted = candidates[0] if candidates else None
+    if not np.any(mask):
+        reason = 'no foreground above threshold'
+    elif accepted is not None:
+        reason = 'detected'
+    elif below_area and not above_area:
+        reason = 'blobs below minimum area'
+    elif above_area and not below_area:
+        reason = 'blobs above maximum area'
+    else:
+        reason = 'no blob within area limits'
+    diagnostics = {
+        'reason': reason,
+        'foreground_pixels': int(np.count_nonzero(mask)),
+        'below_area': below_area,
+        'above_area': above_area,
+        'component_count': int(count - 1),
+    }
+    result = (candidates, accepted, (x0, y0, x1, y1))
+    return (*result, diagnostics) if return_diagnostics else result
 
 
 def _track_blob_range(read_frame, background, marker_data, settings):
@@ -316,6 +390,10 @@ def _track_blob_range(read_frame, background, marker_data, settings):
     total_misses = 0
     residuals = []
     stopped_frame = None
+    failure_counts = {}
+    attempted = 0
+    detected_areas = []
+    detected_contrasts = []
     for frame_ind in sequence:
         prediction = kalman.predict(timestep)
         if explicitly_marked[frame_ind]:
@@ -326,10 +404,13 @@ def _track_blob_range(read_frame, background, marker_data, settings):
             continue
 
         frame = read_frame(frame_ind)
-        candidates, accepted, _ = _detect_blob_candidates(
-            frame, background, prediction, detection_settings
+        attempted += 1
+        candidates, accepted, _, diagnostics = _detect_blob_candidates(
+            frame, background, prediction, detection_settings, return_diagnostics=True
         )
         if accepted is None:
+            reason = diagnostics['reason']
+            failure_counts[reason] = failure_counts.get(reason, 0) + 1
             misses += 1
             total_misses += 1
             if misses > int(settings['max_missed_frames']):
@@ -338,6 +419,8 @@ def _track_blob_range(read_frame, background, marker_data, settings):
             continue
 
         results[int(frame_ind)] = accepted['position']
+        detected_areas.append(accepted['area'])
+        detected_contrasts.append(accepted['contrast'])
         kalman.correct(accepted['position'])
         misses = 0
 
@@ -349,6 +432,10 @@ def _track_blob_range(read_frame, background, marker_data, settings):
         'stopped_frame': stopped_frame,
         'residuals': residuals,
         'end_residual': next((value for frame, value in residuals if frame == end), None),
+        'attempted': attempted,
+        'failure_counts': failure_counts,
+        'detected_areas': detected_areas,
+        'detected_contrasts': detected_contrasts,
     }
 
 
@@ -2920,6 +3007,7 @@ class TrackingDialog(QtWidgets.QDialog):
         self.st_win = st_win
         self.qsettings = QtCore.QSettings('TheobaldLab', 'Jink3D')
         self.background_cache = {}
+        self.run_baselines = {}
         self.setWindowTitle('Automatic tracking')
         self.setModal(True)
         self.setMinimumWidth(850)
@@ -2981,15 +3069,21 @@ class TrackingDialog(QtWidgets.QDialog):
         form.addRow('Background samples:', self.background_samples)
         form.addRow('Maximum missed frames:', self.max_missed_frames)
 
-        self.note = QtWidgets.QLabel('Test previews one frame without changing marker data.')
+        self.note = QtWidgets.QLabel('Tests and analysis use original grayscale video values.')
         self.note.setWordWrap(True)
         controls.addWidget(self.note)
 
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Cancel)
-        self.test_button = buttons.addButton('Test', QtWidgets.QDialogButtonBox.ActionRole)
-        self.run_button = buttons.addButton('Run', QtWidgets.QDialogButtonBox.AcceptRole)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        self.analyze_button = buttons.addButton('Analyze seed', QtWidgets.QDialogButtonBox.ActionRole)
+        self.test_button = buttons.addButton('Test frame', QtWidgets.QDialogButtonBox.ActionRole)
+        self.range_button = buttons.addButton('Test range', QtWidgets.QDialogButtonBox.ActionRole)
+        self.tune_button = buttons.addButton('Auto tune', QtWidgets.QDialogButtonBox.ActionRole)
+        self.run_button = buttons.addButton('Run', QtWidgets.QDialogButtonBox.ActionRole)
+        self.analyze_button.clicked.connect(self._analyze_seed)
         self.test_button.clicked.connect(self._test)
-        self.run_button.clicked.connect(self.accept)
+        self.range_button.clicked.connect(self._test_range)
+        self.tune_button.clicked.connect(self._auto_tune)
+        self.run_button.clicked.connect(self._run)
         buttons.rejected.connect(self.reject)
         controls.addWidget(buttons)
 
@@ -2998,6 +3092,11 @@ class TrackingDialog(QtWidgets.QDialog):
         self.preview_summary = QtWidgets.QLabel('Click Test to preview blob detection.')
         self.preview_summary.setWordWrap(True)
         preview.addWidget(self.preview_summary)
+        self.analysis_results = QtWidgets.QPlainTextEdit()
+        self.analysis_results.setReadOnly(True)
+        self.analysis_results.setMaximumHeight(190)
+        self.analysis_results.setPlaceholderText('Seed analysis and range diagnostics appear here.')
+        preview.addWidget(self.analysis_results)
         self.preview_images = []
         for _ in range(2):
             label = QtWidgets.QLabel()
@@ -3102,16 +3201,81 @@ class TrackingDialog(QtWidgets.QDialog):
             label.show()
         self.preview_summary.setText('\n'.join(summaries))
 
-    def accept(self):
+    def _validate_controls(self):
         settings = self.settings()
         if settings['start_frame'] >= settings['end_frame']:
-            self.note.setText('Start frame must be less than end frame.')
-            return
+            raise ValueError('Start frame must be less than end frame.')
         if settings['min_blob_area'] > settings['max_blob_area']:
-            self.note.setText('Minimum blob area must not exceed maximum blob area.')
+            raise ValueError('Minimum blob area must not exceed maximum blob area.')
+        return settings
+
+    def _show_error(self, error):
+        self.analysis_results.setPlainText(str(error))
+
+    def _analyze_seed(self):
+        try:
+            settings = self._validate_controls()
+            analyses = self.st_win.analyze_tracking_seed(settings, self.background_cache)
+            minimum_contrast = min(item['suggested_contrast'] for item in analyses)
+            minimum_area = min(item['suggested_min_area'] for item in analyses)
+            maximum_area = max(item['suggested_max_area'] for item in analyses)
+            self.minimum_contrast.setValue(minimum_contrast)
+            self.min_blob_area.setValue(minimum_area)
+            self.max_blob_area.setValue(maximum_area)
+            lines = ['Seed analysis', '-------------']
+            for item in analyses:
+                lines.extend([
+                    f"Camera {item['camera_ind'] + 1}: {item['polarity']} target",
+                    f"seed contrast: {item['contrast']:.1f} grayscale levels",
+                    f"background noise: {item['noise']:.1f}",
+                    f"estimated blob area: {item['estimated_area']} px²",
+                    f"suggested minimum contrast: {item['suggested_contrast']}",
+                    f"suggested blob area: {item['suggested_min_area']}–{item['suggested_max_area']} px²",
+                    '',
+                ])
+            if len(analyses) > 1:
+                lines.append('Shared controls use the most permissive contrast and broadest area range.')
+            self.analysis_results.setPlainText('\n'.join(lines).rstrip())
+        except Exception as error:
+            self._show_error(error)
+
+    def _test_range(self):
+        try:
+            report = self.st_win.test_blob_tracking_range(
+                self._validate_controls(), self.background_cache
+            )
+            self.analysis_results.setPlainText(report)
+        except Exception as error:
+            self._show_error(error)
+
+    def _auto_tune(self):
+        try:
+            result = self.st_win.auto_tune_blob_tracking(
+                self._validate_controls(), self.background_cache
+            )
+            self.minimum_contrast.setValue(result['minimum_contrast'])
+            self.min_blob_area.setValue(result['min_blob_area'])
+            self.max_blob_area.setValue(result['max_blob_area'])
+            self.analysis_results.setPlainText(result['report'])
+        except Exception as error:
+            self._show_error(error)
+
+    def _run(self):
+        try:
+            settings = self._validate_controls()
+        except Exception as error:
+            self._show_error(error)
             return
         self._save_settings()
-        super().accept()
+        for camera_ind in self.st_win._tracking_camera_indices(settings):
+            key = (camera_ind, settings['marker_ind'])
+            marker = self.st_win.ims[camera_ind].data[settings['marker_ind']]
+            if key not in self.run_baselines:
+                self.run_baselines[key] = marker.copy()
+            else:
+                marker[:] = self.run_baselines[key]
+        report = self.st_win.run_blob_tracking(settings, self.background_cache)
+        self.analysis_results.setPlainText(report)
 
 
 ###############################
@@ -3387,6 +3551,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         tracking_menu = menubar.addMenu('Tracking')
         auto_tracking_action = QtWidgets.QAction('Auto tracking...', self)
         auto_tracking_action.triggered.connect(self.open_tracking_dialog)
+        auto_tracking_action.setShortcut(QtCore.Qt.CTRL + QtCore.Qt.Key_T)
         tracking_menu.addAction(auto_tracking_action)
 
         #  calibration menu
@@ -3767,14 +3932,12 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
             )
 
     def open_tracking_dialog(self):
-        """Open settings, then run background-subtracted blob tracking."""
+        """Open the iterative background-subtracted blob tracking tool."""
         if len(self.ims) != 2 or not all(getattr(im, 'fn', '') for im in self.ims):
             self.console_write('Need loaded videos before automatic tracking.', 'Blob tracking failed')
             return
         dialog = TrackingDialog(self, self)
-        if dialog.exec_() != QtWidgets.QDialog.Accepted:
-            return
-        self.run_blob_tracking(dialog.settings(), dialog.background_cache)
+        dialog.exec_()
 
     def _tracking_camera_indices(self, settings):
         camera = settings['camera']
@@ -3843,6 +4006,202 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
             if not np.all(np.isfinite(im.data[marker_ind, :2, seed])):
                 raise ValueError(f'Marker seed at frame {seed} is not finite.')
 
+    def analyze_tracking_seed(self, settings, cache=None):
+        """Analyze marked seeds using the same raw frames/background as tracking."""
+        camera_indices = self._tracking_camera_indices(settings)
+        self._validate_tracking_settings(settings, camera_indices)
+        analyses = []
+        current_frame = int(self.frame_slider.value())
+        try:
+            for camera_ind in camera_indices:
+                seed_frame = settings['end_frame'] if settings['mode'] == 'backward' else settings['start_frame']
+                position = self.ims[camera_ind].data[settings['marker_ind'], :2, seed_frame]
+                frame = self._read_tracking_frame(camera_ind, seed_frame)
+                background = self._build_tracking_background(camera_ind, settings, cache)
+                analysis = _analyze_blob_seed(frame, background, position)
+                analysis.update(camera_ind=camera_ind, seed_frame=seed_frame)
+                analyses.append(analysis)
+        finally:
+            self.change_frame(current_frame)
+        return analyses
+
+    def _tracking_test_predictions(self, camera_ind, settings, frame_indices):
+        """Make a transparent rough expected path for sampled-range diagnostics."""
+        marker = self.ims[camera_ind].data[settings['marker_ind']]
+        start, end = settings['start_frame'], settings['end_frame']
+        if settings['mode'] == 'between':
+            fraction = (frame_indices - start) / float(end - start)
+            return (marker[:2, start, None] * (1 - fraction)
+                    + marker[:2, end, None] * fraction).T
+
+        seed_frame = end if settings['mode'] == 'backward' else start
+        seed = marker[:2, seed_frame].astype(float)
+        velocity = np.zeros(2, dtype=float)
+        marked = np.flatnonzero(marker[2] == 1).astype(int)
+        if settings['mode'] == 'forward':
+            previous = marked[marked < start]
+            if previous.size:
+                prior = int(previous[-1])
+                velocity = (seed - marker[:2, prior]) / float(start - prior)
+        else:
+            following = marked[marked > end]
+            if following.size:
+                later = int(following[0])
+                velocity = (marker[:2, later] - seed) / float(later - end)
+        return seed + (frame_indices[:, None] - seed_frame) * velocity
+
+    def _evaluate_tracking_samples(self, camera_ind, settings, background, sample_count=15):
+        frame_indices = np.unique(np.linspace(
+            settings['start_frame'], settings['end_frame'],
+            min(sample_count, settings['end_frame'] - settings['start_frame'] + 1), dtype=int
+        ))
+        predictions = self._tracking_test_predictions(camera_ind, settings, frame_indices)
+        seed_frame = settings['end_frame'] if settings['mode'] == 'backward' else settings['start_frame']
+        seed_position = self.ims[camera_ind].data[settings['marker_ind'], :2, seed_frame]
+        seed_image = self._read_tracking_frame(camera_ind, seed_frame)
+        polarity = settings['target_polarity']
+        if polarity == 'auto':
+            polarity = _analyze_blob_seed(seed_image, background, seed_position)['polarity']
+        detection_settings = dict(settings, polarity=polarity)
+        detections = []
+        failures = {}
+        ambiguity = 0
+        for frame_ind, prediction in zip(frame_indices, predictions):
+            frame = self._read_tracking_frame(camera_ind, int(frame_ind))
+            candidates, accepted, _, diagnostics = _detect_blob_candidates(
+                frame, background, prediction, detection_settings, return_diagnostics=True
+            )
+            if accepted is None:
+                reason = diagnostics['reason']
+                failures[reason] = failures.get(reason, 0) + 1
+                continue
+            if len(candidates) > 1 and candidates[1]['distance'] <= accepted['distance'] + 3:
+                ambiguity += 1
+            detections.append(accepted)
+        return {
+            'camera_ind': camera_ind,
+            'sampled': int(frame_indices.size),
+            'polarity': polarity,
+            'detections': detections,
+            'failures': failures,
+            'ambiguous': ambiguity,
+        }
+
+    @staticmethod
+    def _tracking_suggestion(failures):
+        if not failures:
+            return ''
+        reason = max(failures, key=failures.get)
+        suggestions = {
+            'no foreground above threshold': 'Try lower minimum contrast.',
+            'blobs below minimum area': 'Try lower minimum blob area.',
+            'blobs above maximum area': 'Try increase maximum blob area or minimum contrast.',
+            'prediction outside image': 'Try improve the seed or anchor placement.',
+            'no blob within area limits': 'Try broaden the blob-area limits.',
+        }
+        return suggestions.get(reason, '')
+
+    def test_blob_tracking_range(self, settings, cache=None):
+        """Evaluate segmentation on 15 evenly spaced raw frames without mutation."""
+        camera_indices = self._tracking_camera_indices(settings)
+        self._validate_tracking_settings(settings, camera_indices)
+        current_frame = int(self.frame_slider.value())
+        reports = []
+        try:
+            for camera_ind in camera_indices:
+                background = self._build_tracking_background(camera_ind, settings, cache)
+                result = self._evaluate_tracking_samples(camera_ind, settings, background)
+                detected = result['detections']
+                lines = [
+                    f'Camera {camera_ind + 1} range test',
+                    '-------------------',
+                    f"target: {result['polarity']}",
+                    f"detected: {len(detected)} / {result['sampled']} sample frames",
+                ]
+                for reason, count in sorted(result['failures'].items()):
+                    lines.append(f'{count} {reason}')
+                if result['ambiguous']:
+                    lines.append(f"{result['ambiguous']} frames had similarly close candidates")
+                if detected:
+                    areas = np.array([item['area'] for item in detected])
+                    contrasts = np.array([item['contrast'] for item in detected])
+                    lines.extend([
+                        f'blob area: median {np.median(areas):.0f}, range {areas.min()}–{areas.max()} px²',
+                        f'target contrast: median {np.median(contrasts):.1f}, '
+                        f'range {contrasts.min():.1f}–{contrasts.max():.1f}',
+                    ])
+                suggestion = self._tracking_suggestion(result['failures'])
+                if suggestion:
+                    lines.append(f'Suggestion: {suggestion}')
+                reports.append('\n'.join(lines))
+        finally:
+            self.change_frame(current_frame)
+        return '\n\n'.join(reports)
+
+    def auto_tune_blob_tracking(self, settings, cache=None):
+        """Deterministically search a small seed-informed parameter grid."""
+        camera_indices = self._tracking_camera_indices(settings)
+        analyses = self.analyze_tracking_seed(settings, cache)
+        contrast_values = {int(settings['minimum_contrast'])}
+        for analysis in analyses:
+            for fraction in (.25, .4, .6):
+                contrast_values.add(int(np.clip(round(analysis['contrast'] * fraction), 1, 255)))
+            contrast_values.add(int(analysis['suggested_contrast']))
+        area_estimates = [item['estimated_area'] for item in analyses]
+        area_ranges = {
+            (max(1, int(np.floor(min(area_estimates) * lo))),
+             max(2, int(np.ceil(max(area_estimates) * hi))))
+            for lo, hi in ((.15, 6.), (.25, 4.), (.4, 3.))
+        }
+        area_ranges.add((settings['min_blob_area'], settings['max_blob_area']))
+        backgrounds = {
+            camera_ind: self._build_tracking_background(camera_ind, settings, cache)
+            for camera_ind in camera_indices
+        }
+        best = None
+        current_frame = int(self.frame_slider.value())
+        try:
+            for contrast in sorted(contrast_values):
+                for minimum_area, maximum_area in sorted(area_ranges):
+                    trial = dict(settings, minimum_contrast=contrast,
+                                 min_blob_area=minimum_area, max_blob_area=maximum_area)
+                    evaluations = [
+                        self._evaluate_tracking_samples(camera_ind, trial, backgrounds[camera_ind])
+                        for camera_ind in camera_indices
+                    ]
+                    detections = [item for result in evaluations for item in result['detections']]
+                    detected_count = len(detections)
+                    sampled = sum(result['sampled'] for result in evaluations)
+                    distances = [item['distance'] for item in detections]
+                    areas = [item['area'] for item in detections]
+                    competing = sum(result['ambiguous'] for result in evaluations)
+                    variability = (np.std(areas) / max(np.mean(areas), 1.)) if areas else 1.
+                    score = (100. * detected_count / max(sampled, 1)
+                             - (np.mean(distances) if distances else settings['search_radius'])
+                             - 5. * variability - 2. * competing)
+                    candidate = (score, detected_count, -contrast, minimum_area, maximum_area, sampled)
+                    if best is None or candidate > best:
+                        best = candidate
+        finally:
+            self.change_frame(current_frame)
+        _, detected_count, neg_contrast, minimum_area, maximum_area, sampled = best
+        contrast = -neg_contrast
+        report = (
+            'Auto tune\n---------\n'
+            f'sampled frames: {sampled}\n'
+            f'detected: {detected_count} / {sampled}\n'
+            f'target: {", ".join(f"camera {item["camera_ind"] + 1} {item["polarity"]}" for item in analyses)}\n'
+            f'minimum contrast: {contrast}\n'
+            f'blob area: {minimum_area}–{maximum_area} px²\n'
+            f'search radius: {settings["search_radius"]} px'
+        )
+        return {
+            'minimum_contrast': contrast,
+            'min_blob_area': minimum_area,
+            'max_blob_area': maximum_area,
+            'report': report,
+        }
+
     def test_blob_tracking(self, settings, cache=None):
         """Return annotated one-frame previews without modifying marker data."""
         camera_indices = self._tracking_camera_indices(settings)
@@ -3862,10 +4221,18 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
                 prediction = marker[:2, frame_ind].astype(float)
                 frame = self._read_tracking_frame(camera_ind, frame_ind)
                 polarity = settings['target_polarity']
+                try:
+                    seed_analysis = _analyze_blob_seed(frame, background, prediction)
+                    seed_detail = f"seed contrast: {seed_analysis['contrast']:.1f}; "
+                except ValueError:
+                    seed_analysis = None
+                    seed_detail = 'seed contrast: ambiguous; '
                 if polarity == 'auto':
-                    polarity = _infer_blob_polarity(
-                        frame, background, prediction, settings['minimum_contrast']
-                    )
+                    if seed_analysis is None:
+                        raise ValueError(
+                            'Could not determine target polarity from the selected seed frame.'
+                        )
+                    polarity = seed_analysis['polarity']
                 detection_settings = dict(settings, polarity=polarity)
                 candidates, accepted, roi = _detect_blob_candidates(
                     frame, background, prediction, detection_settings
@@ -3890,6 +4257,8 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
                     'image': annotated,
                     'summary': (
                         f'Camera {camera_ind + 1}, frame {frame_ind}: polarity: {polarity}; '
+                        f'{seed_detail}'
+                        f'threshold: {settings["minimum_contrast"]}; '
                         f'candidates: {len(candidates)}; {detail}'
                     )
                 })
@@ -3930,6 +4299,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
                 )
             self.camera_to_3d(settings['marker_ind'])
 
+            dialog_reports = []
             for camera_ind, result in runs.items():
                 residual_values = [value for _, value in result['residuals']]
                 stopped = (
@@ -3945,9 +4315,12 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
                     '',
                     f'existing anchors preserved: {result["anchors"]}',
                     f'new blob positions: {len(result["positions"])}',
+                    f'frames attempted: {result["attempted"]}',
                     f'missed frames: {result["missed"]}',
                     f'tracking stopped: {stopped}',
                 ]
+                for reason, count in sorted(result['failure_counts'].items()):
+                    lines.append(f'{reason}: {count}')
                 if residual_values:
                     lines.extend([
                         '',
@@ -3960,9 +4333,15 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
                     '',
                     'Automatic positions are currently stored as ordinary Jink marked points.'
                 ])
+                suggestion = self._tracking_suggestion(result['failure_counts'])
+                if suggestion:
+                    lines.insert(-2, f'Suggestion: {suggestion}')
                 self.console_write('\n'.join(lines), 'Blob tracking')
+                dialog_reports.append(f'Camera {camera_ind + 1}\n' + '\n'.join(lines[5:]))
+            return '\n\n'.join(dialog_reports)
         except Exception as error:
             self.console_write(str(error), 'Blob tracking failed')
+            return f'Tracking failed\n---------------\n{error}'
         finally:
             self.change_frame(current_frame)
 

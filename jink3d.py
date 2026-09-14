@@ -1119,6 +1119,7 @@ class Imframe():
     '''
 
     def __init__(self, box, parent, num_markers=9):
+        self.parent = parent
         # add the image to whatever box was passed
         self.imview = pg.ImageView()
         self.imhist = self.imview.getHistogramWidget()
@@ -1141,10 +1142,13 @@ class Imframe():
         self.null_interp = InterpolatedUnivariateSpline([0, 0.01], [np.nan, np.nan], k=1)
         self.interp = [[self.null_interp for xy in range(2)] for m in range(self.num_markers)]
         # markers for data
-        self.markers = [pg.TargetItem() for marker in range(self.num_markers)]
+        self.markers = [
+            pg.TargetItem(size=self.parent.marker_size)
+            for marker in range(self.num_markers)
+        ]
         for marker_ind, marker in enumerate(self.markers):
             marker.setToolTip(str(marker_ind + 1))
-            marker.setPen(QtGui.QPen(QtGui.QColor(*colors[marker_ind])))
+            self.apply_marker_style(marker_ind, marked=True)
             # marker.sigPositionChanged.connect(self.marker_moved)
             marker.hide()  # initially invisible
             self.imview.addItem(marker)
@@ -1157,8 +1161,7 @@ class Imframe():
         self.mousepos = (0, 0)
         self.cal_inds = []
 
-        # for communicating with the main window
-        self.parent = parent
+        # self.parent communicates marker and display changes to the main window
 
     def load_avi(self, fn):
         '''Get an avi file and read and display the first frame'''
@@ -1273,10 +1276,7 @@ class Imframe():
                 self.markers[marker_ind].hide()
 
             else:
-                alpha = 200 if marked else 50
-                brush = pg.mkBrush(*colors[marker_ind], alpha)
-
-                self.markers[marker_ind].setBrush(brush)
+                self.apply_marker_style(marker_ind, marked)
                 self.markers[marker_ind].setPos((x, y))
                 self.markers[marker_ind].show()
 
@@ -1291,6 +1291,31 @@ class Imframe():
             self.nmarkers.show()
         else:
             self.nmarkers.clear()
+
+    def apply_marker_style(self, marker_ind, marked):
+        '''Apply global image-marker display preferences for one marker state.'''
+        marker = self.markers[marker_ind]
+        explicit_alpha = int(round(255 * self.parent.marker_opacity / 100.))
+        alpha = explicit_alpha if marked else int(round(explicit_alpha * .25))
+        color = QtGui.QColor(*colors[marker_ind], alpha)
+        marker.setPen(pg.mkPen(color))
+        marker.setBrush(pg.mkBrush(color))
+        marker.setHoverPen(pg.mkPen(QtGui.QColor(255, 0, 255, alpha)))
+        marker.setHoverBrush(pg.mkBrush(QtGui.QColor(0, 255, 255, alpha)))
+
+        # TargetItem exposes its constructor size as ``scale`` but has no
+        # public size setter in the pyqtgraph versions supported by Jink.
+        if marker.scale != self.parent.marker_size:
+            marker.prepareGeometryChange()
+            marker.scale = self.parent.marker_size
+            marker._shape = None
+        marker.update()
+
+    def apply_marker_styles(self):
+        '''Restyle all normal image markers without changing positions/data.'''
+        for marker_ind in range(self.num_markers):
+            marked = bool(self.data[marker_ind, 2, self.frame_ind])
+            self.apply_marker_style(marker_ind, marked)
 
     def get_data(self, marker_ind, frame_ind):
         '''Get the position of the marker, and interpolate if it's not marked
@@ -3409,6 +3434,17 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         self.get_csv_fn = False
         # self.dir = ''
         self.curr_marker = 0
+        self.qsettings = QtCore.QSettings('TheobaldLab', 'Jink3D')
+        try:
+            stored_opacity = int(self.qsettings.value('markers/opacity', 78))
+        except (TypeError, ValueError):
+            stored_opacity = 78
+        try:
+            stored_size = int(self.qsettings.value('markers/size', 10))
+        except (TypeError, ValueError):
+            stored_size = 10
+        self.marker_opacity = int(np.clip(stored_opacity, 0, 100))
+        self.marker_size = int(np.clip(stored_size, 2, 30))
 
         ### menubar
         menubar = self.menuBar()
@@ -3602,6 +3638,42 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
             actions.append(action)
 
         mark_menu.addActions(actions)
+        mark_menu.addSeparator()
+
+        opacity_widget = QtWidgets.QWidget(mark_menu)
+        opacity_layout = QtWidgets.QHBoxLayout(opacity_widget)
+        opacity_layout.setContentsMargins(8, 2, 8, 2)
+        opacity_layout.addWidget(QtWidgets.QLabel('Opacity'))
+        self.marker_opacity_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.marker_opacity_slider.setRange(0, 100)
+        self.marker_opacity_slider.setValue(self.marker_opacity)
+        self.marker_opacity_slider.setMinimumWidth(130)
+        opacity_layout.addWidget(self.marker_opacity_slider)
+        self.marker_opacity_value = QtWidgets.QLabel(f'{self.marker_opacity}%')
+        self.marker_opacity_value.setMinimumWidth(38)
+        opacity_layout.addWidget(self.marker_opacity_value)
+        opacity_action = QtWidgets.QWidgetAction(self)
+        opacity_action.setDefaultWidget(opacity_widget)
+        mark_menu.addAction(opacity_action)
+
+        size_widget = QtWidgets.QWidget(mark_menu)
+        size_layout = QtWidgets.QHBoxLayout(size_widget)
+        size_layout.setContentsMargins(8, 2, 8, 2)
+        size_layout.addWidget(QtWidgets.QLabel('Size'))
+        self.marker_size_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.marker_size_slider.setRange(2, 30)
+        self.marker_size_slider.setValue(self.marker_size)
+        self.marker_size_slider.setMinimumWidth(130)
+        size_layout.addWidget(self.marker_size_slider)
+        self.marker_size_value = QtWidgets.QLabel(f'{self.marker_size} px')
+        self.marker_size_value.setMinimumWidth(38)
+        size_layout.addWidget(self.marker_size_value)
+        size_action = QtWidgets.QWidgetAction(self)
+        size_action.setDefaultWidget(size_widget)
+        mark_menu.addAction(size_action)
+
+        self.marker_opacity_slider.valueChanged.connect(self.set_marker_opacity)
+        self.marker_size_slider.valueChanged.connect(self.set_marker_size)
 
         #  help menu
         help_menu = menubar.addMenu('Help')
@@ -5408,6 +5480,25 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         # label.setStyleSheet(f'background-color: {color.name()};')
         label.setStyleSheet(f'color: {color.name()}; font-size: 18px;')
         label.setToolTip(fn)
+
+    def set_marker_opacity(self, value):
+        '''Set and persist global opacity for ordinary 2D image markers.'''
+        self.marker_opacity = int(np.clip(value, 0, 100))
+        self.marker_opacity_value.setText(f'{self.marker_opacity}%')
+        self.qsettings.setValue('markers/opacity', self.marker_opacity)
+        self.update_marker_display_settings()
+
+    def set_marker_size(self, value):
+        '''Set and persist global size for ordinary 2D image markers.'''
+        self.marker_size = int(np.clip(value, 2, 30))
+        self.marker_size_value.setText(f'{self.marker_size} px')
+        self.qsettings.setValue('markers/size', self.marker_size)
+        self.update_marker_display_settings()
+
+    def update_marker_display_settings(self):
+        '''Apply marker rendering preferences directly to both image views.'''
+        for im in getattr(self, 'ims', []):
+            im.apply_marker_styles()
 
     def choose_marker(self, arg=0):
         '''Choose the current active marker for clicks

@@ -167,6 +167,34 @@ def _read_deeplabcut_h5(fn):
     return pd.read_hdf(fn, key=key)
 
 
+def _crop_square_with_padding(frame, center, size):
+    """Return a fixed-size square centered on an image point, black-padded."""
+    frame = np.asarray(frame)
+    size = int(size)
+    if size < 1 or frame.ndim not in (2, 3):
+        raise ValueError(f'Cannot crop frame shape {frame.shape} to size {size}.')
+    center = np.asarray(center, dtype=float)
+    if center.shape != (2,) or not np.all(np.isfinite(center)):
+        raise ValueError(f'Invalid crop center: {center}.')
+
+    x0 = int(np.rint(center[0] - (size - 1) / 2.))
+    y0 = int(np.rint(center[1] - (size - 1) / 2.))
+    x1, y1 = x0 + size, y0 + size
+    source_x0, source_x1 = max(0, x0), min(frame.shape[1], x1)
+    source_y0, source_y1 = max(0, y0), min(frame.shape[0], y1)
+
+    output_shape = (size, size) if frame.ndim == 2 else (size, size, frame.shape[2])
+    output = np.zeros(output_shape, dtype=frame.dtype)
+    if source_x0 < source_x1 and source_y0 < source_y1:
+        destination_x0 = source_x0 - x0
+        destination_y0 = source_y0 - y0
+        output[
+            destination_y0:destination_y0 + source_y1 - source_y0,
+            destination_x0:destination_x0 + source_x1 - source_x0,
+        ] = frame[source_y0:source_y1, source_x0:source_x1]
+    return output
+
+
 class BlobKalman:
     """Small constant-velocity Kalman filter using frames as time units."""
 
@@ -3020,6 +3048,186 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
         return QtGui.QPixmap.fromImage(qimage)
 
 
+###########################
+### Video export dialog ###
+###########################
+
+class VideoExportDialog(QtWidgets.QDialog):
+    """Configure a tracked/fixed multi-panel AVI export."""
+
+    def __init__(self, st_win, parent=None):
+        super().__init__(parent)
+        self.st_win = st_win
+        self.setWindowTitle('Export tracked video')
+        self.setMinimumWidth(560)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+        layout.addLayout(form)
+
+        self.marker = QtWidgets.QComboBox()
+        for marker_ind in range(st_win.num_markers):
+            self.marker.addItem(str(marker_ind + 1), marker_ind)
+        self.marker.setCurrentIndex(int(np.clip(st_win.curr_marker, 0, st_win.num_markers - 1)))
+        form.addRow('Marker:', self.marker)
+
+        frames = QtWidgets.QWidget()
+        frame_layout = QtWidgets.QHBoxLayout(frames)
+        frame_layout.setContentsMargins(0, 0, 0, 0)
+        maximum_frame = max(0, int(st_win.num_frames) - 1)
+        self.start_frame = QtWidgets.QSpinBox()
+        self.end_frame = QtWidgets.QSpinBox()
+        self.start_frame.setRange(0, maximum_frame)
+        self.end_frame.setRange(0, maximum_frame)
+        self.end_frame.setValue(maximum_frame)
+        frame_layout.addWidget(QtWidgets.QLabel('Start'))
+        frame_layout.addWidget(self.start_frame)
+        frame_layout.addWidget(QtWidgets.QLabel('End'))
+        frame_layout.addWidget(self.end_frame)
+        frame_layout.addStretch(1)
+        form.addRow('Frames:', frames)
+
+        view = QtWidgets.QWidget()
+        view_layout = QtWidgets.QHBoxLayout(view)
+        view_layout.setContentsMargins(0, 0, 0, 0)
+        self.follow = QtWidgets.QRadioButton('Follow marker')
+        self.fixed = QtWidgets.QRadioButton('Fixed view of trajectory')
+        self.follow.setChecked(True)
+        view_layout.addWidget(self.follow)
+        view_layout.addWidget(self.fixed)
+        form.addRow('View:', view)
+
+        self.crop_size = QtWidgets.QSpinBox()
+        self.crop_size.setRange(16, 4096)
+        self.crop_size.setValue(256)
+        self.crop_size.setSuffix(' px')
+        form.addRow('Crop size:', self.crop_size)
+
+        panels = QtWidgets.QWidget()
+        panel_layout = QtWidgets.QHBoxLayout(panels)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        self.camera1 = QtWidgets.QCheckBox('Camera 1')
+        self.camera2 = QtWidgets.QCheckBox('Camera 2')
+        self.three_d = QtWidgets.QCheckBox('3D trajectory')
+        self.camera1.setChecked(True)
+        panel_layout.addWidget(self.camera1)
+        panel_layout.addWidget(self.camera2)
+        panel_layout.addWidget(self.three_d)
+        form.addRow('Output panels:', panels)
+
+        self.playback_fps = QtWidgets.QDoubleSpinBox()
+        self.playback_fps.setRange(.1, 1000.)
+        self.playback_fps.setDecimals(2)
+        self.playback_fps.setValue(30.)
+        self.playback_fps.setSuffix(' fps')
+        form.addRow('Playback FPS:', self.playback_fps)
+
+        output = QtWidgets.QWidget()
+        output_layout = QtWidgets.QHBoxLayout(output)
+        output_layout.setContentsMargins(0, 0, 0, 0)
+        self.output_file = QtWidgets.QLineEdit(self._default_output_file())
+        browse = QtWidgets.QPushButton('Browse...')
+        browse.clicked.connect(self._browse)
+        output_layout.addWidget(self.output_file, 1)
+        output_layout.addWidget(browse)
+        form.addRow('Output file:', output)
+
+        self.summary = QtWidgets.QLabel()
+        self.summary.setWordWrap(True)
+        self.summary.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
+        self.summary.setMinimumHeight(90)
+        layout.addWidget(self.summary)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        self.export_button = buttons.addButton('Export', QtWidgets.QDialogButtonBox.ActionRole)
+        self.export_button.clicked.connect(self._export)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        for control in (self.marker, self.start_frame, self.end_frame, self.crop_size,
+                        self.camera1, self.camera2, self.three_d, self.playback_fps,
+                        self.follow, self.fixed):
+            signal = getattr(control, 'valueChanged', None)
+            if signal is None:
+                signal = getattr(control, 'currentIndexChanged', None)
+            if signal is None:
+                signal = getattr(control, 'toggled')
+            signal.connect(self._update_summary)
+        self.marker.currentIndexChanged.connect(self._marker_changed)
+        self._marker_changed()
+
+    def _default_output_file(self):
+        source = self.st_win.fns[0] if self.st_win.fns else ''
+        directory = os.path.dirname(source)
+        stem = os.path.splitext(os.path.basename(source))[0] or 'jink3d'
+        return os.path.join(directory, f'{stem}_tracked.avi')
+
+    def _browse(self):
+        fn = QtWidgets.QFileDialog.getSaveFileName(
+            self, 'Export tracked video', self.output_file.text(), 'AVI files (*.avi)'
+        )[0]
+        if fn:
+            if not fn.lower().endswith('.avi'):
+                fn += '.avi'
+            self.output_file.setText(fn)
+
+    def _marker_changed(self):
+        valid = self.st_win.marker_export_valid_range(self.marker.currentData(), 0)
+        if valid is not None:
+            self.start_frame.setValue(valid[0])
+            self.end_frame.setValue(valid[1])
+        self._update_summary()
+
+    def settings(self):
+        return {
+            'marker_ind': int(self.marker.currentData()),
+            'start_frame': int(self.start_frame.value()),
+            'end_frame': int(self.end_frame.value()),
+            'mode': 'fixed' if self.fixed.isChecked() else 'follow',
+            'crop_size': int(self.crop_size.value()),
+            'camera_panels': [
+                index for index, control in enumerate((self.camera1, self.camera2))
+                if control.isChecked()
+            ],
+            'three_d': self.three_d.isChecked(),
+            'fps': float(self.playback_fps.value()),
+            'output_file': self.output_file.text().strip(),
+        }
+
+    def _update_summary(self, *args):
+        try:
+            preflight = self.st_win.video_export_preflight(self.settings())
+            self.summary.setText(preflight['summary'])
+            self.export_button.setEnabled(True)
+        except Exception as error:
+            self.summary.setText(str(error))
+            self.export_button.setEnabled(False)
+
+    def _export(self):
+        settings = self.settings()
+        if not settings['output_file']:
+            self.summary.setText('Choose an output AVI filename.')
+            return
+        if not settings['output_file'].lower().endswith('.avi'):
+            settings['output_file'] += '.avi'
+            self.output_file.setText(settings['output_file'])
+        if os.path.exists(settings['output_file']):
+            answer = QtWidgets.QMessageBox.question(
+                self, 'Replace existing AVI?',
+                f'{settings["output_file"]} already exists. Replace it?',
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+        try:
+            result = self.st_win.export_tracked_video(settings)
+            self.summary.setText(result)
+        except Exception as error:
+            self.summary.setText(f'Video export failed: {error}')
+            self.st_win.console_write(str(error), 'video export failed')
+
+
 #######################
 ### Tracking dialog ###
 #######################
@@ -3494,6 +3702,10 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         export_npy_as_action.triggered.connect(self.export_npy_as)
 
         file_menu.addActions([export_npy_action, export_npy_as_action, export_csv_action, export_csv_as_action])
+
+        export_video_action = QtWidgets.QAction('Export tracked video...', self)
+        export_video_action.triggered.connect(self.open_video_export_dialog)
+        file_menu.addAction(export_video_action)
 
         file_menu.addSeparator()
 
@@ -5118,6 +5330,240 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
 
         else:
             self.console_write('no save filename')
+
+    def open_video_export_dialog(self):
+        '''Open tracked/fixed raw-camera and 3D AVI export settings.'''
+        if len(self.ims) != 2 or not all(getattr(im, 'fn', '') for im in self.ims):
+            self.console_write('Load the camera videos before exporting.', 'video export failed')
+            return
+        VideoExportDialog(self, self).exec_()
+
+    def marker_export_valid_range(self, marker_ind, camera_ind):
+        '''Return the first/last finite current trajectory positions, if any.'''
+        if not (0 <= int(camera_ind) < len(self.ims)):
+            return None
+        im = self.ims[int(camera_ind)]
+        valid = []
+        for frame_ind in range(im.num_frames):
+            x, y, _ = im.get_data(int(marker_ind), frame_ind)
+            if np.isfinite(x) and np.isfinite(y):
+                valid.append(frame_ind)
+        return (valid[0], valid[-1]) if valid else None
+
+    def _marker_export_positions(self, marker_ind, camera_ind, start_frame, end_frame):
+        '''Read Jink's explicit/interpolated 2D trajectory for an inclusive range.'''
+        im = self.ims[camera_ind]
+        if start_frame < 0 or end_frame >= im.num_frames:
+            raise ValueError(
+                f'Camera {camera_ind + 1} contains frames 0–{im.num_frames - 1}; '
+                f'cannot export {start_frame}–{end_frame}.'
+            )
+        positions = np.empty((end_frame - start_frame + 1, 2), dtype=float)
+        for offset, frame_ind in enumerate(range(start_frame, end_frame + 1)):
+            x, y, _ = im.get_data(marker_ind, frame_ind)
+            positions[offset] = x, y
+        if not np.all(np.isfinite(positions)):
+            valid = self.marker_export_valid_range(marker_ind, camera_ind)
+            valid_text = 'none' if valid is None else f'{valid[0]}–{valid[1]}'
+            raise ValueError(
+                f'Marker {marker_ind + 1} does not have a valid Camera {camera_ind + 1} '
+                f'position over frames {start_frame}–{end_frame}. Valid range is {valid_text}.'
+            )
+        return positions
+
+    def video_export_preflight(self, settings):
+        '''Validate export dependencies and calculate crop/composite geometry.'''
+        marker_ind = int(settings['marker_ind'])
+        start_frame = int(settings['start_frame'])
+        end_frame = int(settings['end_frame'])
+        camera_panels = list(settings['camera_panels'])
+        include_3d = bool(settings['three_d'])
+        if not camera_panels and not include_3d:
+            raise ValueError('Select at least one output panel.')
+        if any(camera_ind not in range(len(self.ims)) for camera_ind in camera_panels):
+            raise ValueError(f'Invalid camera panel selection: {camera_panels}.')
+        if not (0 <= marker_ind < self.num_markers):
+            raise ValueError(f'Marker {marker_ind + 1} is outside the available marker range.')
+        if not (0 <= start_frame <= end_frame < self.num_frames):
+            raise ValueError(
+                f'Frames must satisfy 0 ≤ start ≤ end < {self.num_frames}; '
+                f'got {start_frame}–{end_frame}.'
+            )
+        if not np.isfinite(settings['fps']) or float(settings['fps']) <= 0:
+            raise ValueError('Playback FPS must be greater than zero.')
+        if settings['mode'] not in ('follow', 'fixed'):
+            raise ValueError(f'Unknown video export view mode: {settings["mode"]}.')
+        if int(settings['crop_size']) < 1:
+            raise ValueError('Crop size must be greater than zero.')
+
+        positions = {
+            camera_ind: self._marker_export_positions(
+                marker_ind, camera_ind, start_frame, end_frame
+            )
+            for camera_ind in camera_panels
+        }
+        fixed_centers = {}
+        required_sizes = {}
+        requested_size = int(settings['crop_size'])
+        actual_size = requested_size
+        if settings['mode'] == 'fixed':
+            for camera_ind, camera_positions in positions.items():
+                minimum = camera_positions.min(axis=0)
+                maximum = camera_positions.max(axis=0)
+                fixed_centers[camera_ind] = (minimum + maximum) / 2.
+                span = float(np.max(maximum - minimum))
+                required_sizes[camera_ind] = max(1, int(np.ceil(span * 1.10)))
+            if required_sizes:
+                actual_size = max(requested_size, max(required_sizes.values()))
+
+        if include_3d:
+            if not self.td.got_cal:
+                raise ValueError('3D output requires calibrated camera geometry.')
+            valid_3d = np.asarray(self.td.get_valid_inds(marker_ind), dtype=int)
+            requested_frames = np.arange(start_frame, end_frame + 1, dtype=int)
+            if (not np.all(np.isin(requested_frames, valid_3d))
+                    or not np.all(np.isfinite(self.td.data[marker_ind, :, requested_frames]))):
+                if valid_3d.size:
+                    valid_text = f'{valid_3d.min()}–{valid_3d.max()}'
+                else:
+                    valid_text = 'none'
+                raise ValueError(
+                    f'3D output requires a valid 3D trajectory for marker {marker_ind + 1} '
+                    f'over frames {start_frame}–{end_frame}. Valid range is {valid_text}.'
+                )
+
+        panel_names = [f'Camera {index + 1}' for index in camera_panels]
+        if include_3d:
+            panel_names.append('3D')
+        frame_count = end_frame - start_frame + 1
+        duration = frame_count / float(settings['fps'])
+        summary_lines = [
+            f'Frames: {start_frame}–{end_frame} ({frame_count} frames)',
+            f'Panels: {", ".join(panel_names)}',
+            f'Panel size: {actual_size} × {actual_size}',
+            f'Output size: {actual_size * len(panel_names)} × {actual_size}',
+            f'Playback: {float(settings["fps"]):g} fps; duration: {duration:.2f} s',
+        ]
+        if settings['mode'] == 'fixed' and required_sizes:
+            required = max(required_sizes.values())
+            summary_lines.append(
+                f'Requested crop size: {requested_size} px; fixed-view trajectory '
+                f'requires: {required} px; actual panel size: {actual_size} px.'
+            )
+        return {
+            'positions': positions,
+            'fixed_centers': fixed_centers,
+            'required_sizes': required_sizes,
+            'panel_size': actual_size,
+            'panel_names': panel_names,
+            'frame_count': frame_count,
+            'summary': '\n'.join(summary_lines),
+        }
+
+    def _capture_3d_export_panel(self, size):
+        '''Render the existing GL scene and view camera to a square BGR image.'''
+        rgba = self.td.view.renderToArray((int(size), int(size)))
+        rgba = np.asarray(rgba, dtype=np.uint8)
+        if rgba.shape != (size, size, 4):
+            raise ValueError(f'Unexpected 3D framebuffer shape: {rgba.shape}.')
+        # pyqtgraph renderToArray defaults to vertically corrected BGRA.
+        return np.ascontiguousarray(cv.cvtColor(rgba, cv.COLOR_BGRA2BGR))
+
+    def export_tracked_video(self, settings):
+        '''Write selected raw-camera crops and the current 3D view to one AVI.'''
+        preflight = self.video_export_preflight(settings)
+        output_file = settings['output_file']
+        if not output_file:
+            raise ValueError('Choose an output AVI filename.')
+        if not output_file.lower().endswith('.avi'):
+            output_file += '.avi'
+        output_path = os.path.abspath(output_file)
+        source_paths = {os.path.abspath(fn) for fn in self.fns if fn}
+        if output_path in source_paths:
+            raise ValueError('The export filename must not overwrite a loaded source video.')
+
+        panel_size = preflight['panel_size']
+        camera_panels = list(settings['camera_panels'])
+        original_frame = int(self.frame_slider.value())
+        captures = {}
+        writer = None
+        canceled = False
+        progress = QtWidgets.QProgressDialog(
+            'Preparing video export...', 'Cancel', 0, preflight['frame_count'], self
+        )
+        progress.setWindowTitle('Export tracked video')
+        progress.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+        try:
+            for camera_ind in camera_panels:
+                capture = cv.VideoCapture(self.fns[camera_ind])
+                if not capture.isOpened():
+                    raise ValueError(f'Could not open {self.fns[camera_ind]} for export.')
+                capture.set(cv.CAP_PROP_POS_FRAMES, settings['start_frame'])
+                captures[camera_ind] = capture
+
+            width = panel_size * len(preflight['panel_names'])
+            fourcc = cv.VideoWriter_fourcc(*'MJPG')
+            writer = cv.VideoWriter(
+                output_file, fourcc, float(settings['fps']), (width, panel_size), True
+            )
+            if not writer.isOpened():
+                raise ValueError(f'Could not create AVI writer for {output_file}.')
+
+            for offset, frame_ind in enumerate(
+                    range(settings['start_frame'], settings['end_frame'] + 1)):
+                progress.setLabelText(
+                    f'Rendering frame {offset + 1} / {preflight["frame_count"]}'
+                )
+                QtWidgets.QApplication.processEvents()
+                if progress.wasCanceled():
+                    canceled = True
+                    break
+
+                panels = []
+                for camera_ind in camera_panels:
+                    ok, frame = captures[camera_ind].read()
+                    if not ok or frame is None:
+                        raise ValueError(
+                            f'Could not read Camera {camera_ind + 1} frame {frame_ind}.'
+                        )
+                    if frame.ndim == 2:
+                        frame = cv.cvtColor(frame, cv.COLOR_GRAY2BGR)
+                    elif frame.shape[2] == 4:
+                        frame = cv.cvtColor(frame, cv.COLOR_BGRA2BGR)
+                    center = (
+                        preflight['fixed_centers'][camera_ind]
+                        if settings['mode'] == 'fixed'
+                        else preflight['positions'][camera_ind][offset]
+                    )
+                    panels.append(_crop_square_with_padding(frame, center, panel_size))
+
+                if settings['three_d']:
+                    self.td.set_frame(frame_ind)
+                    self.td.view.update()
+                    QtWidgets.QApplication.processEvents()
+                    panels.append(self._capture_3d_export_panel(panel_size))
+
+                composite = np.ascontiguousarray(np.hstack(panels), dtype=np.uint8)
+                writer.write(composite)
+                progress.setValue(offset + 1)
+        finally:
+            if writer is not None:
+                writer.release()
+            for capture in captures.values():
+                capture.release()
+            progress.close()
+            self.change_frame(original_frame)
+
+        if canceled:
+            message = (
+                f'Video export canceled. Partial AVI retained at:\n{output_file}'
+            )
+            self.console_write(message, 'video export')
+            return message
+        message = f'{preflight["summary"]}\n\nSaved: {output_file}'
+        self.console_write(message, 'video export')
+        return message
 
     def export_npy_as(self):
         '''Save the marker and 3d data with a dialog to get the filename.

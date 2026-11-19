@@ -20,6 +20,9 @@ import pyqtgraph.console
 
 from scipy.interpolate import InterpolatedUnivariateSpline
 
+from video_io import VIDEO_FILTER, open_video, prepare_video
+from charuco_calibration import make_detector, detection_roi, normalize_view, calibrate_views, validate_geometry
+
 
 def cm_soapbubble(x, y):
     '''soapbubble colors for complex magnitudes and angles.
@@ -193,6 +196,28 @@ def _crop_square_with_padding(frame, center, size):
             destination_x0:destination_x0 + source_x1 - source_x0,
         ] = frame[source_y0:source_y1, source_x0:source_x1]
     return output
+
+
+def _center_crop_image_to_square(image, side):
+    """Crop the largest centered source square, then resize it to ``side``."""
+    image = np.asarray(image)
+    side = int(side)
+    if side < 1 or image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError(f'Cannot crop image shape {image.shape} to square size {side}.')
+    height, width = image.shape[:2]
+    if height < 1 or width < 1:
+        raise ValueError(f'Cannot crop empty image shape {image.shape}.')
+
+    source_side = min(width, height)
+    x0 = (width - source_side) // 2
+    y0 = (height - source_side) // 2
+    square = image[y0:y0 + source_side, x0:x0 + source_side]
+    if source_side == side:
+        return np.ascontiguousarray(square)
+    interpolation = cv.INTER_AREA if source_side > side else cv.INTER_LINEAR
+    return np.ascontiguousarray(
+        cv.resize(square, (side, side), interpolation=interpolation)
+    )
 
 
 class BlobKalman:
@@ -802,7 +827,9 @@ class TDframe():
             valid_inds = self.get_valid_inds(marker_ind)
 
             if n in valid_inds:
-                frame_pt = self.data[marker_ind, :, n]
+                frame_pt = np.asarray(
+                    self.data[marker_ind, :, n], dtype=float
+                ).reshape(1, 3)
                 self.points[marker_ind].setData(pos=frame_pt)
                 self.points[marker_ind].show()
             else:
@@ -912,6 +939,7 @@ class TDframe():
         print(self.cal_inds)
 
         # append the board and image corner locations
+        retained_frames = []
         for ind in self.cal_inds:
             l_ind = self.ims[0].cal_inds.index(ind)
             r_ind = self.ims[1].cal_inds.index(ind)
@@ -949,6 +977,13 @@ class TDframe():
                 l_take = l_take[np.argsort(l_ids[l_take])]
                 r_take = r_take[np.argsort(r_ids[r_take])]
 
+                objects = self.ims[0].board_corners[l_ind][l_take]
+                try:
+                    validate_geometry(objects, l_points[l_take].reshape(-1, 2))
+                    validate_geometry(objects, r_points[r_take].reshape(-1, 2))
+                except ValueError as error:
+                    print(f'{ind}: rejected for stereo calibration - {error}')
+                    continue
                 self.board_corners.append(self.ims[0].board_corners[l_ind][l_take])
                 self.image0_corners.append(l_points[l_take])
                 self.image1_corners.append(r_points[r_take])
@@ -969,6 +1004,9 @@ class TDframe():
                 self.board_corners.append(board_points)
                 self.image0_corners.append(left_points)
                 self.image1_corners.append(right_points)
+
+            retained_frames.append(ind)
+        self.cal_inds = retained_frames
 
         if len(self.board_corners) < 3:
             raise ValueError('Need at least 3 stereo calibration frames with shared board points')
@@ -1191,19 +1229,17 @@ class Imframe():
 
         # self.parent communicates marker and display changes to the main window
 
-    def load_avi(self, fn):
-        '''Get an avi file and read and display the first frame'''
+    def load_avi(self, fn, prepared=None):
+        """Load an AVI or MP4, retaining the historical console API."""
+        capture, count, image = prepare_video(fn) if prepared is None else prepared
+        if hasattr(self, 'cap'):
+            self.cap.release()
         self.fn = fn
-        self.cap = cv.VideoCapture(fn)
-        self.num_frames = int(self.cap.get(cv.CAP_PROP_FRAME_COUNT))
+        self.cap = capture
+        self.num_frames = count
         self.frame_ind = 0
-
-        self.cap.set(cv.CAP_PROP_POS_FRAMES, self.frame_ind)
-        ret, im = self.cap.read()
-        if ret:
-            self.image = cv.cvtColor(im, cv.COLOR_BGR2GRAY)
-            self.h, self.w = self.image.shape
-
+        self.image = image
+        self.h, self.w = image.shape
         self.cal_inds = []
 
     def load_folder(*self, fn):
@@ -1217,6 +1253,11 @@ class Imframe():
         '''
         self.cap.set(cv.CAP_PROP_POS_FRAMES, n)
         ret, im = self.cap.read()
+        if not ret or im is None:
+            self.parent.console_write(
+                f'Could not decode frame {n} of "{self.fn}".', 'Video read error'
+            )
+            return
         if ret:
             self.frame_ind = n
             self.image = cv.cvtColor(im, cv.COLOR_BGR2GRAY)
@@ -1430,7 +1471,51 @@ class Imframe():
 
         self.set_marker(self.parent.curr_marker, add=add)
 
-    def get_calibration(self, inds, num_rows=7, num_cols=6, side_len=11.5, use_roi=True):
+    def calibration_detection_image(self, gray, use_display_levels=True, report=False):
+        '''Return raw or display-level-scaled grayscale for board detection.'''
+        gray = np.asarray(gray)
+        used_levels = None
+        if use_display_levels:
+            try:
+                low, high = self.imhist.item.getLevels()
+                low, high = float(low), float(high)
+            except (AttributeError, TypeError, ValueError):
+                low, high = np.nan, np.nan
+            if np.isfinite(low) and np.isfinite(high) and high > low:
+                gray_float = gray.astype(np.float32, copy=False)
+                detection_image = np.clip(
+                    (gray_float - low) * 255.0 / (high - low), 0, 255
+                ).astype(np.uint8)
+                used_levels = (low, high)
+            else:
+                detection_image = gray
+        else:
+            detection_image = gray
+
+        if report:
+            try:
+                camera = self.parent.ims.index(self) + 1
+                camera_text = f'Camera {camera}: '
+            except (AttributeError, ValueError):
+                camera_text = ''
+            if used_levels is not None:
+                message = (
+                    f'{camera_text}Calibration detection using display levels: '
+                    f'{used_levels[0]:.1f}–{used_levels[1]:.1f}'
+                )
+            elif use_display_levels:
+                message = (
+                    f'{camera_text}Calibration detection using raw grayscale image '
+                    '(display levels unavailable or invalid)'
+                )
+            else:
+                message = f'{camera_text}Calibration detection using raw grayscale image'
+            self.parent.console_write(message)
+
+        return detection_image
+
+    def get_calibration(self, inds, num_rows=7, num_cols=6, side_len=11.5,
+                        use_roi=True, use_display_levels=True):
         """Try to get calibration from marked frames, then set the projection
         matrix.
         """
@@ -1451,6 +1536,7 @@ class Imframe():
         board_pts[:, :2] = np.mgrid[0:num_rows, 0:num_cols].T.reshape(-1, 2)
         board_pts *= side_len
 
+        reported_detection_mode = False
         for ind in inds:
             self.cap.set(cv.CAP_PROP_POS_FRAMES, ind)
             im_found, im = self.cap.read()
@@ -1460,12 +1546,13 @@ class Imframe():
                 continue
 
             im = cv.cvtColor(im, cv.COLOR_BGR2GRAY)
+            detection_image = self.calibration_detection_image(
+                im, use_display_levels, report=not reported_detection_mode
+            )
+            reported_detection_mode = True
 
             x_min, y_min = 0, 0
             if use_roi:
-                mn, mx = self.imhist.item.getLevels()
-                i = np.interp(im, [mn, mx], [0, 255]).astype("uint8")
-
                 # visible range in data coordinates
                 (x_min, x_max), (y_min, y_max) = self.imview.getView().viewRange()
 
@@ -1474,12 +1561,12 @@ class Imframe():
                 y_min = max(int(np.floor(y_min)), 0)
                 y_max = min(int(np.ceil(y_max)), im.shape[0])
 
-                roi = i[y_min:y_max, x_min:x_max]
+                roi = detection_image[y_min:y_max, x_min:x_max]
                 if roi.size == 0:
                     print(f"{ind} empty ROI")
                     continue
             else:
-                roi = im
+                roi = detection_image
 
             corners_found, corners = cv.findChessboardCornersSB(
                 roi, (num_rows, num_cols), chess_flags
@@ -1526,7 +1613,8 @@ class Imframe():
             marker_len=11.0,
             dictionary_id=None,
             legacy_pattern=False,
-            use_roi=True):
+            use_roi=True,
+            use_display_levels=True):
         """Detect a ChArUco board and calibrate one camera.
 
         num_rows and num_cols are the numbers of chessboard squares, not the
@@ -1549,26 +1637,14 @@ class Imframe():
         self.board_corners = []
         self.image_corner_ids = []
 
-        dictionary = cv.aruco.getPredefinedDictionary(dictionary_id)
-        board = cv.aruco.CharucoBoard(
-            (num_cols, num_rows),
-            float(side_len),
-            float(marker_len),
-            dictionary
-        )
-        if legacy_pattern and hasattr(board, 'setLegacyPattern'):
-            board.setLegacyPattern(True)
+        board, detect = make_detector(num_cols, num_rows, side_len, marker_len,
+                                      dictionary_id, legacy_pattern)
+        board_corners = board.getChessboardCorners()
+        camera = self.parent.ims.index(self)
+        self.charuco_summary = dict(detected=0, valid=0, rejected=0, success=False)
+        print(f'Camera {camera} calibration preflight:')
 
-        board_corners = board.getChessboardCorners().astype(np.float32)
-        min_corners = 6
-
-        use_new_api = hasattr(cv.aruco, 'CharucoDetector')
-        if use_new_api:
-            detector = cv.aruco.CharucoDetector(board)
-        else:
-            detector = None
-            detector_params = cv.aruco.DetectorParameters()
-
+        reported_detection_mode = False
         for ind in inds:
             self.cap.set(cv.CAP_PROP_POS_FRAMES, ind)
             im_found, im = self.cap.read()
@@ -1578,77 +1654,62 @@ class Imframe():
                 continue
 
             gray = cv.cvtColor(im, cv.COLOR_BGR2GRAY)
-
-            mn, mx = self.imhist.item.getLevels()
-            i = np.interp(gray, [mn, mx], [0, 255]).astype("uint8")
-
-            if use_roi:
-                (x_min, x_max), (y_min, y_max) = self.imview.getView().viewRange()
-                x_min = max(int(np.floor(x_min)), 0)
-                x_max = min(int(np.ceil(x_max)), gray.shape[1])
-                y_min = max(int(np.floor(y_min)), 0)
-                y_max = min(int(np.ceil(y_max)), gray.shape[0])
-
-                roi = i[y_min:y_max, x_min:x_max]
-            else:
-                x_min, y_min = 0, 0
-                roi = gray
-
+            roi, x_min, y_min = detection_roi(
+                self, gray, use_display_levels, use_roi, report=not reported_detection_mode)
+            reported_detection_mode = True
             if roi.size == 0:
-                print(f"{ind} empty ROI")
+                print(f'{ind}: empty ROI')
                 continue
-
-            if use_new_api:
-                charuco_corners, charuco_ids, marker_corners, marker_ids = detector.detectBoard(roi)
-            else:
-                marker_corners, marker_ids, _ = cv.aruco.detectMarkers(
-                    roi, dictionary, parameters=detector_params
-                )
-                if marker_ids is None or len(marker_ids) == 0:
-                    charuco_corners, charuco_ids = None, None
-                else:
-                    _, charuco_corners, charuco_ids = cv.aruco.interpolateCornersCharuco(
-                        marker_corners, marker_ids, roi, board
-                    )
+            try:
+                charuco_corners, charuco_ids, marker_corners, marker_ids = detect(roi)
+            except cv.error as error:
+                print(f'{ind}: ChArUco detection failed: {error}')
+                continue
 
             marker_count = 0 if marker_ids is None else len(marker_ids)
             corner_count = 0 if charuco_ids is None else len(charuco_ids)
             print(f"{ind}: ArUco markers={marker_count}, ChArUco corners={corner_count}")
 
-            if charuco_ids is None or charuco_corners is None or len(charuco_ids) < min_corners:
-                print(f"{ind} only {corner_count} ChArUco corners found")
+            if charuco_ids is None or charuco_corners is None:
                 continue
-
-            charuco_corners = _opencv_image_points(
-                charuco_corners, f'ChArUco corners at frame {ind}'
-            )
-            charuco_ids = _opencv_corner_ids(
-                charuco_ids, f'ChArUco IDs at frame {ind}'
-            )
-            if len(charuco_corners) != len(charuco_ids):
-                raise ValueError(
-                    f'ChArUco corner/ID count mismatch at frame {ind}: '
-                    f'corners {charuco_corners.shape}, IDs {charuco_ids.shape}'
-                )
-            charuco_corners += [x_min, y_min]
-            obj_pts = board_corners[charuco_ids.flatten()]
-
-            self.image_corners.append(charuco_corners)
-            self.board_corners.append(obj_pts)
-            self.image_corner_ids.append(charuco_ids)
+            self.charuco_summary['detected'] += 1
+            try:
+                ids, points, objects = normalize_view(
+                    charuco_ids, charuco_corners, board_corners,
+                    (self.w, self.h), (x_min, y_min))
+            except ValueError as error:
+                self.charuco_summary['rejected'] += 1
+                print(f'{ind}: rejected for calibration - {error}; '
+                      f'IDs {np.shape(charuco_ids)}, image {np.shape(charuco_corners)}')
+                continue
+            print(f'frame {ind}: {len(ids)} points, image {points.shape}, '
+                  f'object {objects.shape}, homography OK')
             self.cal_inds.append(int(ind))
+            self.image_corners.append(points)
+            self.image_corner_ids.append(ids)
+            self.board_corners.append(objects)
 
-        if len(self.image_corners) < 3:
-            print(f"Only found ChArUco boards in {len(self.image_corners)} frame(s); need at least 3.")
+        self.charuco_summary['valid'] = len(self.cal_inds)
+        print(f"accepted {len(self.cal_inds)} / {self.charuco_summary['detected']} detected views")
+        self.update_im()
+        self.show_markers()
+        if len(self.cal_inds) < 3:
+            self.parent.console_write(
+                f'Camera {camera}: only {len(self.cal_inds)} geometrically valid '
+                'ChArUco views; need at least 3.', 'calibration')
             return False
-
-        self.ret, self.mtx, self.dist, self.rvecs, self.tvecs = cv.calibrateCamera(
-            self.board_corners,
-            self.image_corners,
-            (self.w, self.h),
-            None,
-            None,
-        )
+        try:
+            result, keep = calibrate_views(self.board_corners, self.image_corners,
+                                          self.cal_inds, (self.w, self.h))
+        except (cv.error, ValueError) as error:
+            self.parent.console_write(f'Camera {camera} intrinsic calibration failed: {error}',
+                                      'calibration')
+            return False
+        self.charuco_summary['isolated'] = len(self.cal_inds) - len(keep)
+        for name in ('cal_inds', 'image_corners', 'image_corner_ids', 'board_corners'):
+            values = getattr(self, name)
+            setattr(self, name, [values[i] for i in keep])
+        self.ret, self.mtx, self.dist, self.rvecs, self.tvecs = result
 
         self.nmtx, self.roi = cv.getOptimalNewCameraMatrix(
             self.mtx, self.dist, (self.w, self.h), 1, (self.w, self.h)
@@ -1657,11 +1718,13 @@ class Imframe():
         self.update_im()
         self.show_markers()
 
+        self.charuco_summary.update(success=True, rms=self.ret)
         return True
 
     def get_circle_calibration(self, inds, num_rows=4, num_cols=11, side_len=10.0,
                                use_roi=True, grid_type='asymmetric_equal',
-                               first_row_count=None, second_row_count=None):
+                               first_row_count=None, second_row_count=None,
+                               use_display_levels=True):
         self.cal_inds = []
         self.image_corners = []
         self.board_corners = []
@@ -1676,6 +1739,7 @@ class Imframe():
             second_row_count=second_row_count,
         )
 
+        reported_detection_mode = False
         for ind in inds:
             self.cap.set(cv.CAP_PROP_POS_FRAMES, ind)
             im_found, im = self.cap.read()
@@ -1685,24 +1749,25 @@ class Imframe():
                 continue
 
             gray = cv.cvtColor(im, cv.COLOR_BGR2GRAY)
+            detection_image = self.calibration_detection_image(
+                gray, use_display_levels, report=not reported_detection_mode
+            )
+            reported_detection_mode = True
 
             x_min, y_min = 0, 0
             if use_roi:
-                mn, mx = self.imhist.item.getLevels()
-                i = np.interp(gray, [mn, mx], [0, 255]).astype("uint8")
-
                 (x_min, x_max), (y_min, y_max) = self.imview.getView().viewRange()
                 x_min = max(int(np.floor(x_min)), 0)
                 x_max = min(int(np.ceil(x_max)), gray.shape[1])
                 y_min = max(int(np.floor(y_min)), 0)
                 y_max = min(int(np.ceil(y_max)), gray.shape[0])
 
-                roi = i[y_min:y_max, x_min:x_max]
+                roi = detection_image[y_min:y_max, x_min:x_max]
                 if roi.size == 0:
                     print(f"{ind} empty ROI")
                     continue
             else:
-                roi = gray
+                roi = detection_image
 
             centers_found, centers, candidate = find_circle_grid_with_candidates(roi, candidates)
 
@@ -2561,6 +2626,15 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
         self._set_combo_data(self.region, saved_use_roi)
         form.addRow('Detection region:', self.region)
 
+        self.use_display_levels = QtWidgets.QCheckBox('Use adjusted brightness levels')
+        self.use_display_levels.setChecked(
+            self._setting_bool('calibration/use_display_levels', True)
+        )
+        self.use_display_levels.setToolTip(
+            'Use the current image display levels when detecting calibration features.'
+        )
+        form.addRow('', self.use_display_levels)
+
         self.legacy_pattern = QtWidgets.QCheckBox('Use legacy ChArUco pattern')
         self.legacy_pattern.setChecked(self._setting_bool('charuco/legacy_pattern', False))
         form.addRow('', self.legacy_pattern)
@@ -2701,7 +2775,7 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
         # intersections. For asymmetric circle grids, two compact column-count
         # boxes replace the single column-count box above the preview.
         for widget in [self.squares_x, self.squares_y, self.board_preview,
-                       self.square_len, self.region]:
+                       self.square_len, self.region, self.use_display_levels]:
             widget.setEnabled(is_supported)
 
         # These fields only apply to ChArUco boards.
@@ -2771,6 +2845,7 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
             'stop_frame': int(self.stop_frame.value()),
             'frame_step': int(self.frame_step.value()),
             'use_roi': bool(self.region.currentData()),
+            'use_display_levels': self.use_display_levels.isChecked(),
             'legacy_pattern': self.legacy_pattern.isChecked(),
         }
 
@@ -2788,6 +2863,9 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
         self.qsettings.setValue('charuco/stop_frame', settings['stop_frame'])
         self.qsettings.setValue('charuco/frame_step', settings['frame_step'])
         self.qsettings.setValue('charuco/use_roi', settings['use_roi'])
+        self.qsettings.setValue(
+            'calibration/use_display_levels', settings['use_display_levels']
+        )
         self.qsettings.setValue('charuco/legacy_pattern', settings['legacy_pattern'])
         self.qsettings.setValue('circle_grid/grid_type', settings['circle_grid_type'])
         self.qsettings.setValue('circle_grid/odd_col_count', settings['odd_col_count'])
@@ -2849,43 +2927,15 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
             return {'camera': cam_ind, 'ok': False, 'error': f'could not read frame {frame_ind}'}
 
         gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
-        x_min, y_min = 0, 0
-        if settings.get('use_roi', True):
-            mn, mx = im.imhist.item.getLevels()
-            detect_image = np.interp(gray, [mn, mx], [0, 255]).astype('uint8')
-            (x0, x1), (y0, y1) = im.imview.getView().viewRange()
-            x_min = max(int(np.floor(x0)), 0)
-            x_max = min(int(np.ceil(x1)), gray.shape[1])
-            y_min = max(int(np.floor(y0)), 0)
-            y_max = min(int(np.ceil(y1)), gray.shape[0])
-            roi = detect_image[y_min:y_max, x_min:x_max]
-            if roi.size == 0:
-                return {'camera': cam_ind, 'ok': False, 'error': f'empty ROI at frame {frame_ind}'}
-        else:
-            roi = gray
-
-        dictionary = cv.aruco.getPredefinedDictionary(settings['dictionary_id'])
-        board = cv.aruco.CharucoBoard(
-            (int(settings['squares_x']), int(settings['squares_y'])),
-            float(settings['square_len']),
-            float(settings['marker_len']),
-            dictionary
-        )
-        if settings.get('legacy_pattern', False) and hasattr(board, 'setLegacyPattern'):
-            board.setLegacyPattern(True)
-
-        if hasattr(cv.aruco, 'CharucoDetector'):
-            detector = cv.aruco.CharucoDetector(board)
-            charuco_corners, charuco_ids, marker_corners, marker_ids = detector.detectBoard(roi)
-        else:
-            detector_params = cv.aruco.DetectorParameters()
-            marker_corners, marker_ids, _ = cv.aruco.detectMarkers(roi, dictionary, parameters=detector_params)
-            if marker_ids is None or len(marker_ids) == 0:
-                charuco_corners, charuco_ids = None, None
-            else:
-                _, charuco_corners, charuco_ids = cv.aruco.interpolateCornersCharuco(
-                    marker_corners, marker_ids, roi, board
-                )
+        roi, x_min, y_min = detection_roi(
+            im, gray, settings.get('use_display_levels', True),
+            settings.get('use_roi', True), report=True)
+        if roi.size == 0:
+            return {'camera': cam_ind, 'ok': False, 'error': f'empty ROI at frame {frame_ind}'}
+        board, detect = make_detector(
+            settings['squares_x'], settings['squares_y'], settings['square_len'],
+            settings['marker_len'], settings['dictionary_id'], settings.get('legacy_pattern', False))
+        charuco_corners, charuco_ids, marker_corners, marker_ids = detect(roi)
 
         marker_count = 0 if marker_ids is None else len(marker_ids)
         corner_count = 0 if charuco_ids is None else len(charuco_ids)
@@ -2933,10 +2983,11 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
             return {'camera': cam_ind, 'ok': False, 'error': f'could not read frame {frame_ind}'}
 
         gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+        detect_image = im.calibration_detection_image(
+            gray, settings.get('use_display_levels', True), report=True
+        )
         x_min, y_min = 0, 0
         if settings.get('use_roi', True):
-            mn, mx = im.imhist.item.getLevels()
-            detect_image = np.interp(gray, [mn, mx], [0, 255]).astype('uint8')
             (x0, x1), (y0, y1) = im.imview.getView().viewRange()
             x_min = max(int(np.floor(x0)), 0)
             x_max = min(int(np.ceil(x1)), gray.shape[1])
@@ -2946,7 +2997,7 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
             if roi.size == 0:
                 return {'camera': cam_ind, 'ok': False, 'error': f'empty ROI at frame {frame_ind}'}
         else:
-            roi = gray
+            roi = detect_image
 
         # The dialog uses board squares for the visual preview. OpenCV's
         # checkerboard detector wants inner intersections.
@@ -2989,10 +3040,11 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
             return {'camera': cam_ind, 'ok': False, 'error': f'could not read frame {frame_ind}'}
 
         gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+        detect_image = im.calibration_detection_image(
+            gray, settings.get('use_display_levels', True), report=True
+        )
         x_min, y_min = 0, 0
         if settings.get('use_roi', True):
-            mn, mx = im.imhist.item.getLevels()
-            detect_image = np.interp(gray, [mn, mx], [0, 255]).astype('uint8')
             (x0, x1), (y0, y1) = im.imview.getView().viewRange()
             x_min = max(int(np.floor(x0)), 0)
             x_max = min(int(np.ceil(x1)), gray.shape[1])
@@ -3002,7 +3054,7 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
             if roi.size == 0:
                 return {'camera': cam_ind, 'ok': False, 'error': f'empty ROI at frame {frame_ind}'}
         else:
-            roi = gray
+            roi = detect_image
 
         cols = max(1, int(settings['squares_x']))
         rows = max(1, int(settings['squares_y']))
@@ -3660,7 +3712,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         #  file menu
         file_menu = menubar.addMenu('File')
 
-        load_avi_action = QtWidgets.QAction('Open avis...', self)
+        load_avi_action = QtWidgets.QAction('Open videos...', self)
         load_avi_action.triggered.connect(self.load_avis)
         load_avi_action.setShortcut(QtCore.Qt.CTRL + QtCore.Qt.Key_O)
         file_menu.addAction(load_avi_action)
@@ -4070,21 +4122,21 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         self.setMouseTracking(True)
 
     def load_avis(self, fn=None):
-        '''Load all corresponding avis into Imframes, then get the calibration
+        '''Load all corresponding videos into Imframes, then get the calibration
         and the plumbline, if available, and load data if it exists.
 
         '''
         # use a dialog if no fn
         if not fn or not os.path.isfile(fn):
-            fn = str(QtWidgets.QFileDialog.getOpenFileName(self, 'Select video', '', 'avi files (*.avi)')[0])
+            fn = str(QtWidgets.QFileDialog.getOpenFileName(self, 'Select video', '', VIDEO_FILTER)[0])
         d, f = os.path.split(fn)
 
         # look for the corresponding file, starting with L or R
         if f.startswith('L') and os.path.isfile(os.path.join(d, f'R{f[1:]}')):
-            self.fns = [os.path.join(d, f), os.path.join(d, f'R{f[1:]}')]
+            filenames = [os.path.join(d, f), os.path.join(d, f'R{f[1:]}')]
 
         elif f.startswith('R') and os.path.isfile(os.path.join(d, f'L{f[1:]}')):
-            self.fns = [os.path.join(d, f'L{f[1:]}'), os.path.join(d, f)]
+            filenames = [os.path.join(d, f'L{f[1:]}'), os.path.join(d, f)]
 
         # or if fn dialog was cancelled
         elif f == '':
@@ -4092,8 +4144,8 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
 
         # or open a dialog to get the other file
         else:
-            # self.fns = [None, None]
-            fn = str(QtWidgets.QFileDialog.getOpenFileName(self, 'Select other video', '', 'avi files (*.avi)')[0])
+            # filenames = [None, None]
+            fn = str(QtWidgets.QFileDialog.getOpenFileName(self, 'Select other video', '', VIDEO_FILTER)[0])
             d2, f2 = os.path.split(fn)
 
             # if dialog was cancelled
@@ -4101,11 +4153,21 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
                 return
             # otherwise this is the second
             else:
-                self.fns = [os.path.join(d, f), os.path.join(d2, f2)]
+                filenames = [os.path.join(d, f), os.path.join(d2, f2)]
 
         # load the images
-        for im, avi in zip(self.ims, self.fns):
-            im.load_avi(avi)
+        prepared = []
+        try:
+            for filename in filenames:
+                prepared.append(prepare_video(filename))
+        except (ValueError, cv.error) as exc:
+            for capture, _, _ in prepared:
+                capture.release()
+            QtWidgets.QMessageBox.warning(self, 'Could not load videos', str(exc))
+            return
+        self.fns = filenames
+        for im, filename, video in zip(self.ims, self.fns, prepared):
+            im.load_avi(filename, prepared=video)
 
         # how many frames?
         self.num_frames = self.ims[0].num_frames
@@ -4127,7 +4189,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         title_fns = self.fns.copy()
         # get data from txt file:
         for i, fn in enumerate(title_fns):
-            fn_txt = fn[:-3] + 'txt'
+            fn_txt = os.path.splitext(fn)[0] + '.txt'
             if os.path.isfile(fn_txt):
                 f = open(fn_txt, 'r')
                 lns = f.readlines()
@@ -4149,7 +4211,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         self.timeline_marker_selector.setCurrentIndex(timeline_marker)
         self.frame_slider.set_displayed_marker(timeline_marker)
         self.refresh_marker_timeline(clear_selection=True)
-        self.console_write(f'{self.fns[0]}\n{self.fns[1]}', 'loaded AVIs')
+        self.console_write(f'{self.fns[0]}\n{self.fns[1]}', 'loaded videos')
 
     def set_chessboard_size(self, board_rows, board_cols):
         '''Set the calibration rows and columns. The inner squares are one
@@ -4711,7 +4773,11 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
                     num_rows=inner_x,
                     num_cols=inner_y,
                     side_len=side_len,
-                    use_roi=True if settings is None else bool(settings.get('use_roi', True))
+                    use_roi=True if settings is None else bool(settings.get('use_roi', True)),
+                    use_display_levels=(
+                        True if settings is None
+                        else bool(settings.get('use_display_levels', True))
+                    )
                 )
             )
 
@@ -4751,6 +4817,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
                 inds = np.linspace(0, self.num_frames - 1, num, dtype='int')
                 print('no inds marked')
             use_roi = True
+            use_display_levels = True
         else:
             cols = max(1, int(settings['squares_x']))
             rows = max(1, int(settings['squares_y']))
@@ -4760,6 +4827,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
             second_row_count = settings.get('even_col_count', settings.get('second_row_count', cols))
             inds = self._calibration_frame_indices(settings)
             use_roi = bool(settings.get('use_roi', True))
+            use_display_levels = bool(settings.get('use_display_levels', True))
 
         print(f'{inds=}\n')
 
@@ -4774,7 +4842,8 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
                     use_roi=use_roi,
                     grid_type=grid_type,
                     first_row_count=first_row_count,
-                    second_row_count=second_row_count
+                    second_row_count=second_row_count,
+                    use_display_levels=use_display_levels
                 )
             )
 
@@ -4809,6 +4878,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
                 'frame_mode': 'marked_or_even',
                 'num_frames': 20,
                 'use_roi': True,
+                'use_display_levels': True,
                 'legacy_pattern': False,
             }
 
@@ -4819,9 +4889,10 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         print(f'{inds=}\n')
 
         ok = []
-        for im in self.ims:
-            ok.append(
-                im.get_charuco_calibration(
+        for camera, im in enumerate(self.ims):
+            im.charuco_summary = {}
+            try:
+                success = im.get_charuco_calibration(
                     inds,
                     num_rows=rows,
                     num_cols=cols,
@@ -4829,22 +4900,38 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
                     marker_len=float(settings['marker_len']),
                     dictionary_id=settings['dictionary_id'],
                     legacy_pattern=bool(settings.get('legacy_pattern', False)),
-                    use_roi=bool(settings.get('use_roi', True))
+                    use_roi=bool(settings.get('use_roi', True)),
+                    use_display_levels=bool(settings.get('use_display_levels', True))
                 )
-            )
+            except (cv.error, ValueError) as error:
+                self.console_write(f'Camera {camera} calibration failed: {error}', 'calibration')
+                success = False
+            ok.append(success)
+            print(f"Camera {camera}: calibration {'succeeded' if success else 'failed'}")
+
+        summary = ['ChArUco calibration summary']
+        for camera, im in enumerate(self.ims):
+            stats = im.charuco_summary
+            summary.append(
+                f"Camera {camera}: detected {stats.get('detected', 0)}, "
+                f"geometrically valid {stats.get('valid', 0)}, rejected {stats.get('rejected', 0)}, "
+                f"isolated on retry {stats.get('isolated', 0)}; "
+                + (f"intrinsic RMS: {stats['rms']:.4f} px" if stats.get('success') else 'intrinsics failed'))
+        self.console_write('\n'.join(summary), 'calibration')
 
         if not all(ok):
-            self.console_write("ChArUco-board calibration failed.", "calibration")
+            self.console_write("Stereo calibration: not attempted (individual intrinsics failed).", "calibration")
             return
 
         try:
             self.td.get_calibration()
         except Exception as e:
-            self.console_write(f"ChArUco stereo calibration failed: {e}", "calibration")
+            self.console_write(f"Shared stereo frames: {len(self.td.board_corners)}; ChArUco stereo calibration failed: {e}", "calibration")
             return
 
         self.rebuild_3d()
         self.console_write(
+            f'Shared stereo frames: {len(self.td.cal_inds)}\nStereo calibration: succeeded\n'
             f'frames: {self.td.cal_inds}\nroot mean squared error = {self.td.rmse}',
             'calibration'
         )
@@ -5461,13 +5548,27 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         }
 
     def _capture_3d_export_panel(self, size):
-        '''Render the existing GL scene and view camera to a square BGR image.'''
-        rgba = self.td.view.renderToArray((int(size), int(size)))
-        rgba = np.asarray(rgba, dtype=np.uint8)
-        if rgba.shape != (size, size, 4):
-            raise ValueError(f'Unexpected 3D framebuffer shape: {rgba.shape}.')
-        # pyqtgraph renderToArray defaults to vertically corrected BGRA.
-        return np.ascontiguousarray(cv.cvtColor(rgba, cv.COLOR_BGRA2BGR))
+        '''Capture the live GL viewport and resize its centered square crop.'''
+        view = self.td.view
+        view.update()
+        QtWidgets.QApplication.processEvents()
+        view.repaint()
+
+        framebuffer = view.grabFramebuffer()
+        if framebuffer.isNull():
+            raise ValueError('Could not capture the 3D OpenGL framebuffer.')
+        framebuffer = framebuffer.convertToFormat(QtGui.QImage.Format_RGBA8888)
+        width = framebuffer.width()
+        height = framebuffer.height()
+        bytes_per_line = framebuffer.bytesPerLine()
+        pointer = framebuffer.bits()
+        pointer.setsize(height * bytes_per_line)
+        rgba = np.frombuffer(pointer, dtype=np.uint8).reshape(height, bytes_per_line)
+        rgba = rgba[:, :width * 4].reshape(height, width, 4).copy()
+
+        # QOpenGLWidget.grabFramebuffer returns a top-left-oriented QImage.
+        bgr = cv.cvtColor(rgba, cv.COLOR_RGBA2BGR)
+        return _center_crop_image_to_square(bgr, size)
 
     def export_tracked_video(self, settings):
         '''Write selected raw-camera crops and the current 3D view to one AVI.'''
@@ -5488,6 +5589,8 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         captures = {}
         writer = None
         canceled = False
+        original_point_sizes = []
+        original_line_widths = []
         progress = QtWidgets.QProgressDialog(
             'Preparing video export...', 'Cancel', 0, preflight['frame_count'], self
         )
@@ -5495,8 +5598,20 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         progress.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
         progress.setMinimumDuration(0)
         try:
+            if settings['three_d']:
+                original_point_sizes = [
+                    np.array(point.size, copy=True)
+                    if isinstance(point.size, np.ndarray) else point.size
+                    for point in self.td.points
+                ]
+                original_line_widths = [line.width for line in self.td.lines]
+                for point, original_size in zip(self.td.points, original_point_sizes):
+                    point.setData(size=original_size * 1.75)
+                for line, original_width in zip(self.td.lines, original_line_widths):
+                    line.setData(width=original_width * 1.5)
+
             for camera_ind in camera_panels:
-                capture = cv.VideoCapture(self.fns[camera_ind])
+                capture = open_video(self.fns[camera_ind])
                 if not capture.isOpened():
                     raise ValueError(f'Could not open {self.fns[camera_ind]} for export.')
                 capture.set(cv.CAP_PROP_POS_FRAMES, settings['start_frame'])
@@ -5540,8 +5655,12 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
 
                 if settings['three_d']:
                     self.td.set_frame(frame_ind)
-                    self.td.view.update()
-                    QtWidgets.QApplication.processEvents()
+                    marker_point = self.td.points[settings['marker_ind']]
+                    if not marker_point.visible():
+                        raise ValueError(
+                            f'3D marker {settings["marker_ind"] + 1} is not visible '
+                            f'at frame {frame_ind}.'
+                        )
                     panels.append(self._capture_3d_export_panel(panel_size))
 
                 composite = np.ascontiguousarray(np.hstack(panels), dtype=np.uint8)
@@ -5552,6 +5671,10 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
                 writer.release()
             for capture in captures.values():
                 capture.release()
+            for point, original_size in zip(self.td.points, original_point_sizes):
+                point.setData(size=original_size)
+            for line, original_width in zip(self.td.lines, original_line_widths):
+                line.setData(width=original_width)
             progress.close()
             self.change_frame(original_frame)
 
@@ -5784,7 +5907,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         # if we start with L or R, drop that for the save name
         if cname.startswith('L') or cname.startswith('R'):
             cname = cname[1:]
-        # get rid of the .avi
+        # get rid of the video extension
         cname = cname.rsplit('.', 1)[0]
         cname = f'C{cname}.npy'
         cdefaultname = os.path.join(cdir, cname)
@@ -5829,7 +5952,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         # if we start with L or R, drop that for the save name
         if pname.startswith('L') or pname.startswith('R'):
             pname = pname[1:]
-        # get rid of the .avi
+        # get rid of the video extension
         pname = pname.rsplit('.', 1)[0]
         pname = f'P{pname}.npy'
         pdefaultname = os.path.join(pdir, pname)

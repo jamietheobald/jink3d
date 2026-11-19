@@ -6,7 +6,7 @@ Jink3D is a Python application for marking corresponding points in two synchroni
 
 Jink3D currently supports:
 
-- two synchronized AVI videos;
+- two synchronized AVI or MP4 videos;
 - up to nine manually marked points;
 - spline interpolation between marked frames;
 - stereo camera calibration with ChArUco boards, checkerboards, and circle grids;
@@ -56,7 +56,9 @@ np  # NumPy
 
 ## Loading stereo videos
 
-Choose **File → Open avis...** or press **Ctrl+O**.
+Choose **File → Open videos...** or press **Ctrl+O**.
+
+AVI and MP4 files (including uppercase extensions) are accepted. MP4 input prefers OpenCV's FFmpeg backend, with automatic backend selection as a fallback if FFmpeg cannot open the file. Tracked-video output remains MJPEG AVI.
 
 The two videos should:
 
@@ -333,10 +335,61 @@ The native 3D array is organized as markers × coordinates × frames. The NumPy 
 ## Current limitations
 
 - exactly two cameras;
-- AVI input;
+- AVI and MP4 input;
 - synchronized videos with matching frame counts are expected;
 - nine marker identities;
 - camera geometry must remain unchanged between calibration and experimental recording;
 - no wand-based camera calibration yet;
 - circle-grid support should be tested carefully for each printed target;
 - plain checkerboard corner ordering can occasionally be inconsistent between cameras.
+
+## Standalone presentation video
+
+`scripts/render_tracks.py` combines synchronized left/right videos above an animated
+Matplotlib 3D trajectory. It runs without importing Jink or opening Qt. Export the
+reconstructed **3D NumPy data** from Jink first; save the **2D marker data** as well
+for camera highlights and reliable masking of untracked frames.
+
+Install Matplotlib in the existing project environment:
+
+```bash
+uv pip install matplotlib
+.venv/bin/python scripts/render_tracks.py \
+  --left Ltrial.avi --right Rtrial.avi \
+  --data 3Dtrial.npy --observations 2Dtrial.npy \
+  --markers 1 2 --highlight circle --output presentation.mp4
+```
+
+For a separate environment, install `scripts/requirements-render.txt` with pip.
+The script accepts Jink's `(markers, 3, frames)` 3D export and optional
+`(2, markers, 3, frames)` 2D data. Marker numbers start at 1. Both videos and the
+data must have matching frame counts and already be synchronized. Saved 3D data
+must contain the desired calibration and gravity orientation; the renderer does
+not reconstruct or rotate coordinates.
+
+Options include:
+
+- `--start 100 --end 400`: inclusive, zero-based source frame range.
+- `--trail 100`: show the latest 100 frames; default keeps all history since start.
+- `--highlight none|dot|circle` and `--radius 20`: optional camera annotations;
+  radius is in output pixels. 2D observations are interpolated with Jink's spline
+  convention only within marked intervals.
+- `--width 1280 --height 960`: output dimensions. Cameras are letterboxed to
+  preserve their proportions.
+- `--elevation 25 --azimuth -60`: fixed orthographic viewing angle.
+- `--ground-z 0 --units mm`: floor height and axis labels. Default floor is the
+  lowest selected Z, not an inferred physical ground plane. The floor must be
+  at or below every selected point.
+- `--capture-fps 500`: original recording frame rate for the displayed elapsed
+  time (`frame_index / capture_fps`), default 500. Independent of playback speed.
+- `--fps 30`: playback speed override without resampling. Default uses video FPS;
+  differing camera rates require an explicit override.
+
+The plot has fixed limits, equal world-unit scales on all three axes, a floor
+grid at the bottom of Z, and faint trajectory projections on that floor. Without
+2D data, all-zero 3D samples are treated as missing (including a true origin point);
+provide 2D data to disambiguate. Missing samples break the trajectory.
+
+Edit `TrackPanel` in the standalone script to customize the Matplotlib style.
+MP4 output uses OpenCV's `mp4v` codec; AVI uses MJPEG. Existing output files are
+never overwritten. A failed/interrupted render may leave a partial output file.

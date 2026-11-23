@@ -20,6 +20,8 @@ import pyqtgraph.console
 
 from scipy.interpolate import InterpolatedUnivariateSpline
 
+import wand_calibration as wand
+
 from video_io import (VIDEO_FILTER, default_recording_output, find_stereo_pair,
                       open_video, prepare_video)
 from charuco_calibration import make_detector, detection_roi, normalize_view, calibrate_views, validate_geometry
@@ -1990,6 +1992,17 @@ class BoardPreview(QtWidgets.QWidget):
         if rect.width() <= 0 or rect.height() <= 0:
             return
 
+        if self.board_type == 'wand':
+            y = rect.center().y()
+            left, right = rect.left()+18, rect.right()-18
+            painter.drawLine(left, y, right, y)
+            for x, label in ((left, 'A'), (right, 'B')):
+                painter.drawEllipse(QtCore.QPoint(x, y), 5, 5)
+                painter.drawText(x-4, y-10, label)
+            painter.drawText(rect.adjusted(0, 35, 0, 0), QtCore.Qt.AlignCenter,
+                             f'{self.wand_length:g} calibration units')
+            return
+
         if self.board_type == 'circle_grid':
             self._paint_circle_grid(painter, rect)
         else:
@@ -2439,8 +2452,52 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
         self.board_type.addItem('ChArUco board', 'charuco')
         self.board_type.addItem('Checkerboard', 'checkerboard')
         self.board_type.addItem('Circle grid', 'circle_grid')
-        form.addRow('Board type:', self.board_type)
+        self.board_type.addItem('Rigid wand', 'wand')
+        form.addRow('Calibration type:', self.board_type)
         self._set_combo_data(self.board_type, self.qsettings.value('board_calibration/board_type', 'charuco'))
+
+        self.wand_options = QtWidgets.QWidget()
+        wand_form = QtWidgets.QFormLayout(self.wand_options)
+        left.addWidget(self.wand_options)
+        self.wand_length = QtWidgets.QDoubleSpinBox()
+        self.wand_length.setDecimals(6)
+        self.wand_length.setRange(1e-6, 1e9)
+        self.wand_length.setValue(self._setting_float('wand/length', 100))
+        self.wand_length.setToolTip('Physical endpoint center-to-center distance, in your calibration units.')
+        wand_form.addRow('Wand length:', self.wand_length)
+        self.endpoints = []
+        for i, label in enumerate('AB'):
+            combo = QtWidgets.QComboBox()
+            for m in range(st_win.num_markers):
+                combo.addItem(f'Marker {m+1}', m)
+            saved_marker = self._setting_int(f'wand/{label}', i)
+            combo.setCurrentIndex(min(max(0, saved_marker), combo.count() - 1))
+            combo.setToolTip('Use distinguishable endpoints. A and B must match across both cameras.')
+            self.endpoints.append(combo)
+            wand_form.addRow(f'Endpoint {label} marker:', combo)
+        self.wand_limit = QtWidgets.QSpinBox()
+        self.wand_limit.setRange(0, 2**31-1)
+        self.wand_limit.setSpecialValueText('All valid frames')
+        self.wand_limit.setValue(self._setting_int('wand/maximum', 500))
+        wand_form.addRow('Maximum wand frames:', self.wand_limit)
+        self.intrinsics = QtWidgets.QComboBox()
+        self.intrinsics.addItem('Estimate from wand', 'estimate')
+        self.intrinsics.addItem('Keep current intrinsics', 'fixed')
+        available = all(wand.valid_intrinsics(getattr(im, 'mtx', None), getattr(im, 'dist', None))
+                        for im in st_win.ims)
+        self.intrinsics.model().item(1).setEnabled(available)
+        if available:
+            self._set_combo_data(self.intrinsics, self.qsettings.value('wand/intrinsics', 'fixed'))
+        wand_form.addRow('Intrinsics:', self.intrinsics)
+        self.wand_preview = BoardPreview(board_type='wand')
+        self.wand_preview.wand_length = self.wand_length.value()
+        self.wand_length.valueChanged.connect(self._wand_length_changed)
+        wand_form.addRow(self.wand_preview)
+
+        self.board_options = QtWidgets.QWidget()
+        left.addWidget(self.board_options)
+        form = QtWidgets.QFormLayout(self.board_options)
+        form.setContentsMargins(0, 0, 0, 0)
 
         self.circle_grid_type = QtWidgets.QComboBox()
         self.circle_grid_type.addItem('Symmetric circle grid', 'symmetric')
@@ -2653,7 +2710,12 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
         self.detection_preview = CharucoDetectionPreview()
         outer.addWidget(self.detection_preview, 1)
 
+        self.board_type.currentIndexChanged.connect(self.detection_preview.clear)
         self.board_type.currentIndexChanged.connect(self._board_type_changed)
+        self.intrinsics.currentIndexChanged.connect(self._board_type_changed)
+        for index, combo in enumerate(self.endpoints):
+            combo.currentIndexChanged.connect(lambda value, i=index: self._endpoint_changed(i, value))
+        self._endpoint_changed(0, self.endpoints[0].currentIndex())
         self.frame_mode.currentIndexChanged.connect(self._frame_mode_changed)
         self.squares_x.valueChanged.connect(self._update_board_preview)
         self.squares_y.valueChanged.connect(self._update_board_preview)
@@ -2663,6 +2725,16 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
         self._update_board_preview()
         self._board_type_changed()
         self._frame_mode_changed()
+
+    def _endpoint_changed(self, index, value):
+        other = self.endpoints[1-index]
+        if other.count() > 1 and other.currentIndex() == value:
+            other.setCurrentIndex(0 if value else 1)
+        self._board_type_changed()
+
+    def _wand_length_changed(self, length):
+        self.wand_preview.wand_length = length
+        self.wand_preview.update()
 
     def _setting_int(self, key, default):
         value = self.qsettings.value(key, default)
@@ -2758,6 +2830,22 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
 
     def _board_type_changed(self):
         board_type = self.board_type.currentData()
+        is_wand = board_type == 'wand'
+        self.board_options.setVisible(not is_wand)
+        self.wand_options.setVisible(is_wand)
+        if is_wand:
+            ready = (len(set(c.currentData() for c in self.endpoints)) == 2
+                     and all(getattr(im, 'fn', '') for im in self.st_win.ims))
+            self.findChild(QtWidgets.QDialogButtonBox).button(QtWidgets.QDialogButtonBox.Ok).setEnabled(ready)
+            self.test_button.setEnabled(ready)
+            self.note.setText('Mark two distinct endpoints in both loaded videos. Move and rotate the wand '
+                              'through the working volume. ' + (
+                              'Wand-only calibration currently assumes negligible lens distortion.'
+                              if self.intrinsics.currentData() == 'estimate' else
+                              'Current intrinsics and distortion will be held fixed.'))
+            self.detection_preview.clear()
+            self.detection_preview.summary.setText('Click Test to inspect synchronized wand observations.')
+            return
         is_charuco = board_type == 'charuco'
         is_checkerboard = board_type == 'checkerboard'
         is_circle_grid = board_type == 'circle_grid'
@@ -2831,6 +2919,10 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
 
     def settings(self):
         return {
+            'endpoints': [c.currentData() for c in self.endpoints],
+            'wand_length': self.wand_length.value(),
+            'wand_limit': self.wand_limit.value(),
+            'intrinsics': self.intrinsics.currentData(),
             'board_type': self.board_type.currentData(),
             'squares_x': int(self.squares_x.value()),
             'squares_y': int(self.squares_y.value()),
@@ -2855,6 +2947,13 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
     def _save_settings(self):
         settings = self.settings()
         self.qsettings.setValue('board_calibration/board_type', settings['board_type'])
+        if settings['board_type'] == 'wand':
+            for label, marker in zip('AB', settings['endpoints']):
+                self.qsettings.setValue(f'wand/{label}', marker)
+            for key, field in [('length', 'wand_length'), ('maximum', 'wand_limit'), ('intrinsics', 'intrinsics')]:
+                self.qsettings.setValue(f'wand/{key}', settings[field])
+            self.qsettings.sync()
+            return
         self.qsettings.setValue('charuco/squares_x', settings['squares_x'])
         self.qsettings.setValue('charuco/squares_y', settings['squares_y'])
         self.qsettings.setValue('charuco/square_len', settings['square_len'])
@@ -2905,6 +3004,9 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
         results = []
         id_sets = []
         frame_ind = int(self.st_win.frame_slider.value())
+        if board_type == 'wand':
+            self._test_wand(settings, frame_ind)
+            return
         for cam_ind, im in enumerate(self.st_win.ims):
             if board_type == 'charuco':
                 result = self._detect_charuco_in_imframe(im, cam_ind, frame_ind, settings)
@@ -2927,6 +3029,28 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
             shared = len(id_sets[0].intersection(id_sets[1]))
 
         self.detection_preview.set_results(results, shared, board_type=board_type)
+
+    def _test_wand(self, settings, frame_ind):
+        images = self.st_win.ims
+        xy, _, lines = wand.observations(images, settings['endpoints'], settings['wand_limit'])
+        self.detection_preview.clear()
+        self.detection_preview.summary.setText(f'Wand endpoints at frame {frame_ind}')
+        self.detection_preview.details.setPlainText('\n'.join(lines))
+        for c, (im, label) in enumerate(zip(images, self.detection_preview.image_labels)):
+            annotated = cv.cvtColor(im.image, cv.COLOR_GRAY2BGR)
+            points = {}
+            current = xy[frame_ind, c] if frame_ind < len(xy) else []
+            for name, pt in zip('AB', current):
+                if np.isfinite(pt).all():
+                    points[name] = tuple(np.rint(pt).astype(int))
+            if len(points) == 2:
+                cv.line(annotated, points['A'], points['B'], (0, 220, 255), 2)
+            for name, pt in points.items():
+                cv.circle(annotated, pt, 5, (0, 220, 255), 2)
+                cv.putText(annotated, name, (pt[0]+6, pt[1]), cv.FONT_HERSHEY_SIMPLEX,
+                           .7, (0, 220, 255), 2, cv.LINE_AA)
+            label.setPixmap(self._pixmap_from_bgr(annotated).scaled(
+                label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
 
     def _detect_charuco_in_imframe(self, im, cam_ind, frame_ind, settings):
         im.cap.set(cv.CAP_PROP_POS_FRAMES, frame_ind)
@@ -4183,11 +4307,40 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
             self.get_checkerboard(settings=settings)
         elif settings['board_type'] == 'circle_grid':
             self.get_circle_grid(settings=settings)
+        elif settings['board_type'] == 'wand':
+            self.get_wand_calibration(settings)
         else:
             self.console_write(
                 'This board type is not implemented in the dialog yet.',
                 'board calibration'
             )
+
+    def get_wand_calibration(self, settings):
+        sizes = [(im.w, im.h) for im in self.ims]
+        fixed = [(im.mtx, im.dist) for im in self.ims] if settings['intrinsics'] == 'fixed' else None
+        try:
+            xy, ids, lines = wand.observations(self.ims, settings['endpoints'], settings['wand_limit'])
+            result = wand.calibrate(xy[ids], ids, sizes, settings['wand_length'], fixed)
+            new_camera = [cv.getOptimalNewCameraMatrix(k, d, size, 1, size)
+                          for k, d, size in zip(result.matrices, result.distortions, sizes)]
+        except (ValueError, cv.error, np.linalg.LinAlgError) as error:
+            self.console_write(str(error), 'Rigid-wand calibration failed')
+            return
+
+        extrinsics = [np.eye(3, 4), np.column_stack((result.rotation, result.translation))]
+        for c, im in enumerate(self.ims):
+            im.mtx, im.dist = result.matrices[c], result.distortions[c]
+            im.nmtx, im.roi = new_camera[c]
+            im.proj = im.mtx @ extrinsics[c]
+            im.cal_inds = []  # Wand endpoints are displayed by the regular marker system.
+        self.td.R, self.td.T = result.rotation, result.translation
+        self.td.rmse, self.td.cal_inds = result.rms, result.frames.tolist()
+        self.td.got_cal = True
+        self.td.set_camera_markers()
+        self.set_calibration_indicator('chk', 'Rigid wand (unsaved)')
+        self.rebuild_3d()
+        self.console_write('\n'.join([*lines, result.report, 'Stereo calibration succeeded.']),
+                           'Rigid-wand calibration')
 
     def open_tracking_dialog(self):
         """Open the iterative background-subtracted blob tracking tool."""

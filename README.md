@@ -56,7 +56,14 @@ np  # NumPy
 
 ## Loading stereo videos
 
-Choose **File → Open videos...** or press **Ctrl+O**.
+Jink starts maximized as a normal desktop window; **Ctrl+F** still toggles fullscreen.
+
+Choose **File → Open videos...** or press **Ctrl+O**. The video chooser starts at
+about 80% of the available screen and remembers its size, constrained to the
+current screen. It starts in the last successfully loaded video folder.
+**File → Recent video folders** provides the five most recent existing folders;
+selecting one opens the chooser there. Cancelling or failing to load videos does
+not change the folder history.
 
 AVI and MP4 files (including uppercase extensions) are accepted. MP4 input prefers OpenCV's FFmpeg backend, with automatic backend selection as a fallback if FFmpeg cannot open the file. Tracked-video output remains MJPEG AVI.
 
@@ -67,14 +74,13 @@ The two videos should:
 - show overlapping regions of space;
 - remain in the same camera geometry used for calibration.
 
-If the selected filename begins with uppercase `L` or `R`, Jink3D looks in the same directory for a matching file whose first character is replaced by the other letter. For example:
+Automatic stereo pairing recognizes leading `C0`/`C1` and uppercase `L`/`R`
+tokens, looking for the matching file in the same directory. Only the leading
+token changes: `C0_test_C0.avi` pairs with `C1_test_C0.avi`. Either file may be
+selected first; Jink orders the pair as C0 then C1, or L then R.
 
-```text
-Ltrial_001.avi
-Rtrial_001.avi
-```
-
-If no matching file is found, Jink3D asks for the second video.
+If no partner exists, the second-video chooser starts in the first video's
+folder. Cancelling that chooser leaves the current session unchanged.
 
 Camera 0 is treated as the left camera and defines the origin of the reconstructed coordinate system. Camera 1 is positioned relative to it by the stereo calibration.
 
@@ -225,6 +231,33 @@ For asymmetric grids, the odd and even column counts must differ by no more than
 
 OpenCV circle-grid conventions vary among printed targets. Jink3D therefore tries several plausible asymmetric interpretations, with and without clustering. Use **Test** to confirm that the target is found and that the reported interpretation matches the target before running the full calibration.
 
+Circle-grid **Test** now enables **Detailed circle-grid diagnostics** by default.
+It tries the unchanged default grid detector plus permissive dark- and light-blob
+detectors at 1×, 2× and 4×, using every existing pattern interpretation. Permissive
+detectors retain elliptical blobs; their area/separation thresholds scale with
+image size. The separate default blob count is a baseline, not a guarantee of
+what OpenCV's internal grid detector sees.
+
+The preview shows the actual brightness-adjusted or raw grayscale detection
+region at the chosen scale, fitted to the preview box. Cyan dots/links indicate
+an ordered complete grid; magenta rings indicate candidate blobs when no grid
+succeeds. **Circle-grid diagnostics** below the images provides each detector's
+blob count, diameter statistics, spatial extent, and a scrollable per-candidate
+success/failure matrix with candidate-specific expected counts. Its interpretation
+distinguishes sparse blobs, possible grid-organization/geometry failure, and
+success with permissive detection or upsampling, without treating blob counts
+as proof of a correct board.
+
+For visible-region diagnostics, an optional Test-only margin adds 5% of each ROI
+dimension (at least 15 pixels), clipped to the image. Its source coordinates and
+final size are reported. Disable the margin to compare the exact production ROI.
+Disable detailed diagnostics for the original quick Test detector. Neither option
+changes the displayed zoom or normal calibration Run: Run still uses the original
+native-resolution detector and unexpanded ROI. Diagnostic centers are converted
+back to full-frame source coordinates for preview results and are never committed
+to calibration. Upsampling is an experiment, not a source of new image information.
+
+
 ### Running and inspecting calibration
 
 Click **OK** to run detection on the selected frames and estimate:
@@ -343,6 +376,63 @@ The native 3D array is organized as markers × coordinates × frames. The NumPy 
 - circle-grid support should be tested carefully for each printed target;
 - plain checkerboard corner ordering can occasionally be inconsistent between cameras.
 
+## Compose a video in Jink
+
+Choose **File → Export video...** to render from the currently loaded videos,
+2D marker interpolations, and calibrated/oriented 3D reconstruction. No NumPy
+exports or source-file selection are needed. Install the updated dependencies
+with `uv sync` (Matplotlib is now included).
+
+Choose a preset, adjust the panels, select an output filename, and click Export:
+
+- **Cameras side by side**
+- **Cameras above 3D**
+- **Marker crops above 3D**
+- **3D only**
+
+The dialog's left column contains output settings, independent camera brightness
+modes (Raw, Current Jink levels, Custom), and defaults for new 3D panels. The right
+column contains the layout preview, panel list, and selected-panel properties.
+Current Jink levels come directly from each camera's histogram controls; their
+numerical limits are shown. Brightness is applied before colored highlights.
+
+Use a grid of 1–6 rows and columns. GUI positions and spans are one-based. Panels
+can span rows/columns, but cannot overlap or extend outside the grid. Empty cells,
+panel gaps, and letterboxes are black. Output width and height must be even and
+at least 320 pixels. Uneven cell divisions retain the exact requested dimensions.
+
+A panel can show a full camera image, a marker-centered square source crop, or a
+Matplotlib 3D reconstruction. Crops can follow a marker or remain fixed around its
+trajectory bounds; fixed crops grow when needed to include a 10% margin. Crop
+sizes are source pixels; highlights' circle radii are output pixels. Crops require
+valid positions for every requested frame. Highlights and 3D tracks use available
+samples without extrapolation; gaps remain gaps. Each selected 3D marker needs at
+least one valid point in the interval.
+
+Multiple panels can use the same camera or show different 3D viewpoints. Each 3D
+panel has its own checked marker list, view angles, trail, ground height and units.
+The same Matplotlib renderer as the CLI preserves equal world-unit scales, a black
+background, floor grid, faint ground projection, and no legend. Colors use the
+existing renderer palette, assigned in first-3D-panel selection order and shared
+across corresponding camera highlights and other 3D panels.
+
+Playback FPS controls movie speed without resampling. Capture FPS controls the
+source-time annotation (`frame_index / capture_fps`), independently. Acquisition
+FPS from matching camera `.cfg` files initializes both when available; otherwise
+playback defaults to 30 and capture to 500. Saved preferences override these defaults.
+
+The summary reports the frame count, duration, dimensions, grid and panel count.
+Invalid configurations disable Export. AVI uses MJPEG; MP4 uses `mp4v`. Existing
+files require confirmation and source videos cannot be overwritten. Rendering
+uses independent captures/figures and does not change Jink's current frame,
+markers, brightness, calibration or 3D view. Cancel is checked between output
+frames; a partial output file is retained and all rendering resources are closed.
+
+The last presentation settings are remembered. **Save layout... / Load layout...**
+share presentation-only JSON files, excluding source paths, marker data, output
+filename and frame range. Loaded layouts must refer to markers available in the
+current session. Layout edits switch the preset selector to Custom.
+
 ## Standalone presentation video
 
 `scripts/render_tracks.py` combines synchronized left/right videos above an animated
@@ -390,6 +480,8 @@ grid at the bottom of Z, and faint trajectory projections on that floor. Without
 2D data, all-zero 3D samples are treated as missing (including a true origin point);
 provide 2D data to disambiguate. Missing samples break the trajectory.
 
-Edit `TrackPanel` in the standalone script to customize the Matplotlib style.
+Edit `TrackPanel` in `video_render.py` to customize the Matplotlib style shared
+by the CLI and GUI. The CLI is a front end to the same grid compositor, using
+the traditional two-camera row above a spanning 3D panel.
 MP4 output uses OpenCV's `mp4v` codec; AVI uses MJPEG. Existing output files are
 never overwritten. A failed/interrupted render may leave a partial output file.

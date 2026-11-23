@@ -20,8 +20,11 @@ import pyqtgraph.console
 
 from scipy.interpolate import InterpolatedUnivariateSpline
 
-from video_io import VIDEO_FILTER, open_video, prepare_video
+from video_io import (VIDEO_FILTER, default_recording_output, find_stereo_pair,
+                      open_video, prepare_video)
 from charuco_calibration import make_detector, detection_roi, normalize_view, calibrate_views, validate_geometry
+from circle_grid_diagnostics import (diagnostic_roi, detect_circle_grid_diagnostics,
+                                     summarize_circle_diagnostics, interpret_circle_diagnostics)
 
 
 def cm_soapbubble(x, y):
@@ -168,56 +171,6 @@ def _read_deeplabcut_h5(fn):
             f'H5 file contains multiple ambiguous pandas datasets: {", ".join(keys)}'
         )
     return pd.read_hdf(fn, key=key)
-
-
-def _crop_square_with_padding(frame, center, size):
-    """Return a fixed-size square centered on an image point, black-padded."""
-    frame = np.asarray(frame)
-    size = int(size)
-    if size < 1 or frame.ndim not in (2, 3):
-        raise ValueError(f'Cannot crop frame shape {frame.shape} to size {size}.')
-    center = np.asarray(center, dtype=float)
-    if center.shape != (2,) or not np.all(np.isfinite(center)):
-        raise ValueError(f'Invalid crop center: {center}.')
-
-    x0 = int(np.rint(center[0] - (size - 1) / 2.))
-    y0 = int(np.rint(center[1] - (size - 1) / 2.))
-    x1, y1 = x0 + size, y0 + size
-    source_x0, source_x1 = max(0, x0), min(frame.shape[1], x1)
-    source_y0, source_y1 = max(0, y0), min(frame.shape[0], y1)
-
-    output_shape = (size, size) if frame.ndim == 2 else (size, size, frame.shape[2])
-    output = np.zeros(output_shape, dtype=frame.dtype)
-    if source_x0 < source_x1 and source_y0 < source_y1:
-        destination_x0 = source_x0 - x0
-        destination_y0 = source_y0 - y0
-        output[
-            destination_y0:destination_y0 + source_y1 - source_y0,
-            destination_x0:destination_x0 + source_x1 - source_x0,
-        ] = frame[source_y0:source_y1, source_x0:source_x1]
-    return output
-
-
-def _center_crop_image_to_square(image, side):
-    """Crop the largest centered source square, then resize it to ``side``."""
-    image = np.asarray(image)
-    side = int(side)
-    if side < 1 or image.ndim != 3 or image.shape[2] != 3:
-        raise ValueError(f'Cannot crop image shape {image.shape} to square size {side}.')
-    height, width = image.shape[:2]
-    if height < 1 or width < 1:
-        raise ValueError(f'Cannot crop empty image shape {image.shape}.')
-
-    source_side = min(width, height)
-    x0 = (width - source_side) // 2
-    y0 = (height - source_side) // 2
-    square = image[y0:y0 + source_side, x0:x0 + source_side]
-    if source_side == side:
-        return np.ascontiguousarray(square)
-    interpolation = cv.INTER_AREA if source_side > side else cv.INTER_LINEAR
-    return np.ascontiguousarray(
-        cv.resize(square, (side, side), interpolation=interpolation)
-    )
 
 
 class BlobKalman:
@@ -1844,6 +1797,11 @@ def _circle_grid_points_symmetric(cols, rows, spacing):
 
 
 def _circle_grid_points_asymmetric_equal(cols, rows, spacing):
+    """Standard OpenCV staggered grid; spacing is the lattice step.
+
+    Calibration translation and reconstructed 3D positions inherit the units
+    of the entered board spacing (converted from nearest-center distance).
+    """
     pts = np.zeros((cols * rows, 3), np.float32)
     k = 0
     for r in range(rows):
@@ -1882,9 +1840,9 @@ def circle_grid_detection_candidates(cols, rows, spacing, grid_type='asymmetric_
 
     Each candidate has a pattern size for findCirclesGrid, flags, object
     points with matching length, and a descriptive name. The alternating-row
-    case tries the common row-pair convention first, because some printed
-    asymmetric grids are described as alternating short and long rows even though
-    OpenCV detects them as a logical grid.
+    case prioritizes the transposed standard OpenCV topology for even physical
+    row counts with alternating short/long rows differing by one. Older
+    interpretations remain available for comparison in Test and as fallbacks.
     """
     cols = max(1, int(cols))
     rows = max(1, int(rows))
@@ -1903,12 +1861,26 @@ def circle_grid_detection_candidates(cols, rows, spacing, grid_type='asymmetric_
         })
 
     elif grid_type in ('asymmetric', 'asymmetric_alternating'):
-        # Candidate 1: treat each short+long pair of physical rows as one
-        # OpenCV logical asymmetric row. This matches boards visually described
-        # as 5/6 alternating rows, where a row pair contains 11 centers.
+        if rows % 2 == 0 and abs(first_row_count - second_row_count) == 1:
+            logical_cols = rows // 2
+            logical_rows = first_row_count + second_row_count
+            asymmetric_lattice_spacing = spacing / np.sqrt(2.0)
+            candidates.append({
+                'name': f'OpenCV asymmetric transpose, {logical_cols} × {logical_rows}',
+                'pattern_size': (logical_cols, logical_rows),
+                'flags': cv.CALIB_CB_ASYMMETRIC_GRID,
+                # Match findCirclesGrid's logical row-major ordering, not the
+                # physical alternating-row order (which merely has equal count).
+                'object_points': _circle_grid_points_asymmetric_equal(
+                    logical_cols, logical_rows, asymmetric_lattice_spacing),
+            })
+
+        # Retain the older physical-row-pair interpretation for comparison.
+        # Equal point counts alone do not validate its topology or ordering.
+        lattice_spacing = spacing / np.sqrt(2.0)
         if rows % 2 == 0:
             obj = _circle_grid_points_alternating(
-                first_row_count, second_row_count, rows, spacing
+                first_row_count, second_row_count, rows, lattice_spacing
             )
             candidates.append({
                 'name': f'alternating rows {first_row_count}/{second_row_count} row pairs',
@@ -1921,7 +1893,7 @@ def circle_grid_detection_candidates(cols, rows, spacing, grid_type='asymmetric_
         # long-row count as the pattern width. Some printed targets are labeled
         # this way even if the visual bounding columns alternate.
         max_row_count = max(first_row_count, second_row_count)
-        obj = _circle_grid_points_asymmetric_equal(max_row_count, rows, spacing)
+        obj = _circle_grid_points_asymmetric_equal(max_row_count, rows, lattice_spacing)
         candidates.append({
             'name': f'asymmetric equal rows, {max_row_count} × {rows}',
             'pattern_size': (max_row_count, rows),
@@ -1933,7 +1905,7 @@ def circle_grid_detection_candidates(cols, rows, spacing, grid_type='asymmetric_
         # OpenCV pattern width. This is useful for testing ambiguous printed
         # descriptions such as "11×4" with 5/6 visible row counts.
         total_pair_count = first_row_count + second_row_count
-        obj = _circle_grid_points_asymmetric_equal(total_pair_count, rows, spacing)
+        obj = _circle_grid_points_asymmetric_equal(total_pair_count, rows, lattice_spacing)
         candidates.append({
             'name': f'asymmetric logical columns, {total_pair_count} × {rows}',
             'pattern_size': (total_pair_count, rows),
@@ -1942,7 +1914,7 @@ def circle_grid_detection_candidates(cols, rows, spacing, grid_type='asymmetric_
         })
 
     else:
-        obj = _circle_grid_points_asymmetric_equal(cols, rows, spacing)
+        obj = _circle_grid_points_asymmetric_equal(cols, rows, spacing / np.sqrt(2.0))
         candidates.append({
             'name': f'asymmetric equal rows, {cols} × {rows}',
             'pattern_size': (cols, rows),
@@ -1957,6 +1929,9 @@ def circle_grid_detection_candidates(cols, rows, spacing, grid_type='asymmetric_
     for cand in candidates:
         clustered.append({**cand, 'name': cand['name'] + ' + clustering',
                           'flags': cand['flags'] | cv.CALIB_CB_CLUSTERING})
+    if candidates and candidates[0]['name'].startswith('OpenCV asymmetric transpose'):
+        # Prefer both verified topology variants over the older experiments.
+        return [candidates[0], clustered[0]] + candidates[1:] + clustered[1:]
     return candidates + clustered
 
 
@@ -2158,6 +2133,10 @@ class CharucoDetectionPreview(QtWidgets.QWidget):
             image_row.addLayout(box)
             self.image_labels.append(image)
 
+        self.diagnostics_title = QtWidgets.QLabel('Circle-grid diagnostics')
+        self.diagnostics_title.setStyleSheet('font-weight: bold;')
+        self.diagnostics_title.hide()
+        layout.addWidget(self.diagnostics_title)
         self.details = QtWidgets.QPlainTextEdit()
         self.details.setReadOnly(True)
         self.details.setMinimumHeight(130)
@@ -2166,6 +2145,7 @@ class CharucoDetectionPreview(QtWidgets.QWidget):
     def clear(self):
         self.summary.setText('Click Test to detect the board in the current frame pair.')
         self.details.clear()
+        self.diagnostics_title.hide()
         for image in self.image_labels:
             image.clear()
 
@@ -2189,7 +2169,7 @@ class CharucoDetectionPreview(QtWidgets.QWidget):
                     )
             elif board_type == 'circle_grid':
                 if result.get('found'):
-                    mode = result.get('circle_mode')
+                    mode = result.get('preview_description', result.get('circle_mode'))
                     mode_text = f" ({mode})" if mode else ""
                     lines.append(
                         f"Camera {result['camera']}: "
@@ -2199,7 +2179,7 @@ class CharucoDetectionPreview(QtWidgets.QWidget):
                 else:
                     lines.append(
                         f"Camera {result['camera']}: "
-                        f"circle grid not found, 0/{result['expected_corners']} centers"
+                        f"circle grid not found; preview: {result.get('preview_description', 'no centers')}"
                     )
             else:
                 lines.append(
@@ -2208,11 +2188,16 @@ class CharucoDetectionPreview(QtWidgets.QWidget):
                     f"{result['corner_count']} ChArUco corners"
                 )
 
+            if board_type == 'circle_grid' and result.get('interpretation'):
+                lines.append(result['interpretation'].split('. ')[0])
+
         if shared_count is not None:
             lines.append(f"Shared ChArUco corners: {shared_count}")
 
         self.summary.setText('\n'.join(lines))
-        self.details.setPlainText('\n'.join(lines))
+        diagnostic_text = [result['diagnostics'] for result in results if result.get('diagnostics')]
+        self.diagnostics_title.setVisible(bool(diagnostic_text))
+        self.details.setPlainText('\n\n'.join(diagnostic_text) if diagnostic_text else '\n'.join(lines))
 
         for result, image_label in zip(results, self.image_labels):
             pixmap = result.get('pixmap')
@@ -2635,6 +2620,19 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
         )
         form.addRow('', self.use_display_levels)
 
+        self.circle_diagnostics = QtWidgets.QCheckBox('Detailed circle-grid diagnostics (Test only)')
+        self.circle_diagnostics.setChecked(True)
+        form.addRow('', self.circle_diagnostics)
+        self.circle_roi_margin = QtWidgets.QCheckBox('Test ROI margin: 5% (at least 15 px)')
+        self.circle_roi_margin.setChecked(True)
+        self.circle_roi_margin.setToolTip('Expands the visible-region intersection for diagnostics only; Run and display zoom are unchanged.')
+        form.addRow('', self.circle_roi_margin)
+        update_circle_margin = lambda: self.circle_roi_margin.setEnabled(
+            self.circle_diagnostics.isChecked() and bool(self.region.currentData()))
+        self.circle_diagnostics.toggled.connect(update_circle_margin)
+        self.region.currentIndexChanged.connect(update_circle_margin)
+        update_circle_margin()
+
         self.legacy_pattern = QtWidgets.QCheckBox('Use legacy ChArUco pattern')
         self.legacy_pattern.setChecked(self._setting_bool('charuco/legacy_pattern', False))
         form.addRow('', self.legacy_pattern)
@@ -2785,6 +2783,8 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
         self.marker_len.setVisible(is_charuco)
 
         # Circle-grid-only controls.
+        self.circle_diagnostics.setVisible(is_circle_grid)
+        self.circle_roi_margin.setVisible(is_circle_grid)
         self.circle_grid_type.setEnabled(is_circle_grid)
         self.circle_grid_type.setVisible(is_circle_grid)
         self.first_row_count.setEnabled(is_asymmetric_circle)
@@ -2793,7 +2793,10 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
 
         self.col_label.setText('columns')
         self.row_label.setText('rows')
-        self.size_left_label.setText('center spacing' if is_circle_grid else 'square')
+        self.size_left_label.setText('nearest center spacing' if is_circle_grid else 'square')
+        self.square_len.setToolTip(
+            'Physical center-to-center distance between a circle and its nearest neighboring circle. Calibration output uses these same units.'
+            if is_circle_grid else '')
 
         button_box = self.findChild(QtWidgets.QDialogButtonBox)
         if button_box is not None:
@@ -2812,10 +2815,10 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
         elif is_circle_grid:
             if circle_kind == 'symmetric':
                 self.note.setText(
-                    'Symmetric circle grid: columns and rows are circle centers. Size is center-to-center spacing.')
+                    'Symmetric circle grid: enter the physical center-to-center distance between nearest circles. Calibration output uses these same units.')
             else:
                 self.note.setText(
-                    'Asymmetric circle grid: odd and even column counts repeat down the board and must differ by at most one. Rows are total circle rows. Size is nearest-neighbor center spacing. Test this mode before calibration because OpenCV circle-grid conventions vary.'
+                    'Asymmetric circle grid: enter circle counts in alternating physical rows and the total number of physical rows. Spacing is the measured center-to-center distance between nearest circles.'
                 )
         else:
             self.note.setText('This board type is a placeholder for the later unified calibration dialog.')
@@ -2896,6 +2899,8 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
         self._save_settings()
         settings = self.settings()
         board_type = settings['board_type']
+        settings['circle_diagnostics'] = self.circle_diagnostics.isChecked()
+        settings['circle_roi_margin'] = self.circle_roi_margin.isChecked()
 
         results = []
         id_sets = []
@@ -2908,7 +2913,10 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
             elif board_type == 'checkerboard':
                 result = self._detect_checkerboard_in_imframe(im, cam_ind, frame_ind, settings)
             elif board_type == 'circle_grid':
-                result = self._detect_circle_grid_in_imframe(im, cam_ind, frame_ind, settings)
+                try:
+                    result = self._detect_circle_grid_in_imframe(im, cam_ind, frame_ind, settings)
+                except (cv.error, ValueError) as error:
+                    result = {'camera': cam_ind, 'ok': False, 'error': str(error)}
             else:
                 self.detection_preview.summary.setText('This board type is not implemented yet.')
                 return
@@ -3043,18 +3051,13 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
         detect_image = im.calibration_detection_image(
             gray, settings.get('use_display_levels', True), report=True
         )
-        x_min, y_min = 0, 0
-        if settings.get('use_roi', True):
-            (x0, x1), (y0, y1) = im.imview.getView().viewRange()
-            x_min = max(int(np.floor(x0)), 0)
-            x_max = min(int(np.ceil(x1)), gray.shape[1])
-            y_min = max(int(np.floor(y0)), 0)
-            y_max = min(int(np.ceil(y1)), gray.shape[0])
-            roi = detect_image[y_min:y_max, x_min:x_max]
-            if roi.size == 0:
-                return {'camera': cam_ind, 'ok': False, 'error': f'empty ROI at frame {frame_ind}'}
-        else:
-            roi = detect_image
+        detailed = settings.get('circle_diagnostics', True)
+        use_roi = settings.get('use_roi', True)
+        bounds = im.imview.getView().viewRange() if use_roi else None
+        margin = detailed and settings.get('circle_roi_margin', True) and use_roi
+        roi, (x_min, y_min, x_max, y_max) = diagnostic_roi(detect_image, bounds, margin)
+        if roi.size == 0:
+            return {'camera': cam_ind, 'ok': False, 'error': f'empty ROI at frame {frame_ind}'}
 
         cols = max(1, int(settings['squares_x']))
         rows = max(1, int(settings['squares_y']))
@@ -3066,30 +3069,63 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
             first_row_count=settings.get('odd_col_count', settings.get('first_row_count', settings['squares_x'])),
             second_row_count=settings.get('even_col_count', settings.get('second_row_count', settings['squares_x'])),
         )
+        roi_text = (f'Camera {cam_ind}, frame {frame_ind}\n'
+                    f'ROI: {roi.shape[1]} × {roi.shape[0]} source px; '
+                    f'x [{x_min}, {x_max}), y [{y_min}, {y_max}); '
+                    + ('Test margin enabled; Run uses the unexpanded ROI.' if margin else 'No Test margin.'))
+        if settings.get('use_display_levels', True):
+            try:
+                low, high = map(float, im.imhist.item.getLevels())
+                valid_levels = np.isfinite([low, high]).all() and high > low
+            except (AttributeError, TypeError, ValueError):
+                valid_levels = False
+            brightness = f'Adjusted brightness: {low:g}–{high:g}.' if valid_levels else 'Raw grayscale (display levels unavailable/invalid).'
+        else:
+            brightness = 'Raw grayscale (adjusted brightness disabled).'
+        roi_text += '\n' + brightness
+        if detailed:
+            def progress(done, total):
+                self.detection_preview.summary.setText(
+                    f'Circle-grid diagnostics: Camera {cam_ind}, attempt {done + 1}/{total}…')
+                QtWidgets.QApplication.processEvents(QtCore.QEventLoop.ExcludeUserInputEvents)
+            diagnostics = detect_circle_grid_diagnostics(roi, candidates, (x_min, y_min), progress)
+            best = diagnostics['best']
+            chosen = diagnostics['preview_pass']
+            label = 'default' if chosen['detector'] == 'default' else 'permissive ' + chosen['detector']
+            description = f"{chosen['scale']}× {label}"
+            if best:
+                description += f"; {best['candidate']}"
+            else:
+                description += f"; {chosen['count']} candidate blobs"
+            return {
+                'camera': cam_ind, 'ok': True, 'found': best is not None,
+                'corner_count': best['centers'] if best else 0,
+                'expected_corners': best['expected'] if best else len(candidates[0]['object_points']),
+                'circle_mode': best['candidate'] if best else None,
+                'preview_description': description,
+                'interpretation': interpret_circle_diagnostics(diagnostics),
+                'centers': diagnostics['source_centers'],  # preview only, never committed to calibration
+                'pixmap': self._pixmap_from_bgr(diagnostics['annotated']),
+                'diagnostics': roi_text + '\nPreview: ' + description + '\n\n' + summarize_circle_diagnostics(diagnostics),
+            }
+
+        # Optional quick Test uses the unchanged production detector/candidates.
         centers_found, centers, candidate = find_circle_grid_with_candidates(roi, candidates)
-
-        annotated = frame.copy()
-        center_count = 0
+        annotated = cv.cvtColor(roi, cv.COLOR_GRAY2BGR)
+        centers_full = None
         if centers_found and centers is not None:
-            centers_full = _opencv_image_points(
-                centers, f'circle-grid preview centers at frame {frame_ind}'
-            )
-            centers_full[:, :, 0] += x_min
-            centers_full[:, :, 1] += y_min
-            center_count = len(centers_full)
-            for pt in np.asarray(centers_full).reshape(-1, 2):
-                cv.circle(annotated, tuple(np.rint(pt).astype(int)), 4, (0, 255, 255), -1, cv.LINE_AA)
-
-        pixmap = self._pixmap_from_bgr(annotated)
-        expected = len(candidate['object_points']) if candidate is not None else len(candidates[0]['object_points'])
+            normalized = _opencv_image_points(centers)
+            centers_full = normalized.copy() + [x_min, y_min]
+            for point in normalized.reshape(-1, 2):
+                cv.circle(annotated, tuple(np.rint(point).astype(int)), 3, (255, 255, 0), -1, cv.LINE_AA)
         return {
-            'camera': cam_ind,
-            'ok': True,
-            'found': bool(centers_found),
-            'corner_count': center_count,
-            'expected_corners': expected,
-            'circle_mode': None if candidate is None else candidate['name'],
-            'pixmap': pixmap,
+            'camera': cam_ind, 'ok': True, 'found': bool(centers_found),
+            'corner_count': len(centers_full) if centers_full is not None else 0,
+            'expected_corners': len(candidate['object_points']) if candidate is not None else len(candidates[0]['object_points']),
+            'circle_mode': candidate['name'] if candidate else None,
+            'centers': centers_full,
+            'pixmap': self._pixmap_from_bgr(annotated),
+            'diagnostics': roi_text + '\nQuick Test: production detector only; diagnostic scales/detectors disabled.',
         }
 
     def _pixmap_from_bgr(self, image):
@@ -3098,186 +3134,6 @@ class BoardCalibrationDialog(QtWidgets.QDialog):
         h, w, ch = rgb.shape
         qimage = QtGui.QImage(rgb.data, w, h, ch * w, QtGui.QImage.Format_RGB888).copy()
         return QtGui.QPixmap.fromImage(qimage)
-
-
-###########################
-### Video export dialog ###
-###########################
-
-class VideoExportDialog(QtWidgets.QDialog):
-    """Configure a tracked/fixed multi-panel AVI export."""
-
-    def __init__(self, st_win, parent=None):
-        super().__init__(parent)
-        self.st_win = st_win
-        self.setWindowTitle('Export tracked video')
-        self.setMinimumWidth(560)
-
-        layout = QtWidgets.QVBoxLayout(self)
-        form = QtWidgets.QFormLayout()
-        layout.addLayout(form)
-
-        self.marker = QtWidgets.QComboBox()
-        for marker_ind in range(st_win.num_markers):
-            self.marker.addItem(str(marker_ind + 1), marker_ind)
-        self.marker.setCurrentIndex(int(np.clip(st_win.curr_marker, 0, st_win.num_markers - 1)))
-        form.addRow('Marker:', self.marker)
-
-        frames = QtWidgets.QWidget()
-        frame_layout = QtWidgets.QHBoxLayout(frames)
-        frame_layout.setContentsMargins(0, 0, 0, 0)
-        maximum_frame = max(0, int(st_win.num_frames) - 1)
-        self.start_frame = QtWidgets.QSpinBox()
-        self.end_frame = QtWidgets.QSpinBox()
-        self.start_frame.setRange(0, maximum_frame)
-        self.end_frame.setRange(0, maximum_frame)
-        self.end_frame.setValue(maximum_frame)
-        frame_layout.addWidget(QtWidgets.QLabel('Start'))
-        frame_layout.addWidget(self.start_frame)
-        frame_layout.addWidget(QtWidgets.QLabel('End'))
-        frame_layout.addWidget(self.end_frame)
-        frame_layout.addStretch(1)
-        form.addRow('Frames:', frames)
-
-        view = QtWidgets.QWidget()
-        view_layout = QtWidgets.QHBoxLayout(view)
-        view_layout.setContentsMargins(0, 0, 0, 0)
-        self.follow = QtWidgets.QRadioButton('Follow marker')
-        self.fixed = QtWidgets.QRadioButton('Fixed view of trajectory')
-        self.follow.setChecked(True)
-        view_layout.addWidget(self.follow)
-        view_layout.addWidget(self.fixed)
-        form.addRow('View:', view)
-
-        self.crop_size = QtWidgets.QSpinBox()
-        self.crop_size.setRange(16, 4096)
-        self.crop_size.setValue(256)
-        self.crop_size.setSuffix(' px')
-        form.addRow('Crop size:', self.crop_size)
-
-        panels = QtWidgets.QWidget()
-        panel_layout = QtWidgets.QHBoxLayout(panels)
-        panel_layout.setContentsMargins(0, 0, 0, 0)
-        self.camera1 = QtWidgets.QCheckBox('Camera 1')
-        self.camera2 = QtWidgets.QCheckBox('Camera 2')
-        self.three_d = QtWidgets.QCheckBox('3D trajectory')
-        self.camera1.setChecked(True)
-        panel_layout.addWidget(self.camera1)
-        panel_layout.addWidget(self.camera2)
-        panel_layout.addWidget(self.three_d)
-        form.addRow('Output panels:', panels)
-
-        self.playback_fps = QtWidgets.QDoubleSpinBox()
-        self.playback_fps.setRange(.1, 1000.)
-        self.playback_fps.setDecimals(2)
-        self.playback_fps.setValue(30.)
-        self.playback_fps.setSuffix(' fps')
-        form.addRow('Playback FPS:', self.playback_fps)
-
-        output = QtWidgets.QWidget()
-        output_layout = QtWidgets.QHBoxLayout(output)
-        output_layout.setContentsMargins(0, 0, 0, 0)
-        self.output_file = QtWidgets.QLineEdit(self._default_output_file())
-        browse = QtWidgets.QPushButton('Browse...')
-        browse.clicked.connect(self._browse)
-        output_layout.addWidget(self.output_file, 1)
-        output_layout.addWidget(browse)
-        form.addRow('Output file:', output)
-
-        self.summary = QtWidgets.QLabel()
-        self.summary.setWordWrap(True)
-        self.summary.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
-        self.summary.setMinimumHeight(90)
-        layout.addWidget(self.summary)
-
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
-        self.export_button = buttons.addButton('Export', QtWidgets.QDialogButtonBox.ActionRole)
-        self.export_button.clicked.connect(self._export)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-        for control in (self.marker, self.start_frame, self.end_frame, self.crop_size,
-                        self.camera1, self.camera2, self.three_d, self.playback_fps,
-                        self.follow, self.fixed):
-            signal = getattr(control, 'valueChanged', None)
-            if signal is None:
-                signal = getattr(control, 'currentIndexChanged', None)
-            if signal is None:
-                signal = getattr(control, 'toggled')
-            signal.connect(self._update_summary)
-        self.marker.currentIndexChanged.connect(self._marker_changed)
-        self._marker_changed()
-
-    def _default_output_file(self):
-        source = self.st_win.fns[0] if self.st_win.fns else ''
-        directory = os.path.dirname(source)
-        stem = os.path.splitext(os.path.basename(source))[0] or 'jink3d'
-        return os.path.join(directory, f'{stem}_tracked.avi')
-
-    def _browse(self):
-        fn = QtWidgets.QFileDialog.getSaveFileName(
-            self, 'Export tracked video', self.output_file.text(), 'AVI files (*.avi)'
-        )[0]
-        if fn:
-            if not fn.lower().endswith('.avi'):
-                fn += '.avi'
-            self.output_file.setText(fn)
-
-    def _marker_changed(self):
-        valid = self.st_win.marker_export_valid_range(self.marker.currentData(), 0)
-        if valid is not None:
-            self.start_frame.setValue(valid[0])
-            self.end_frame.setValue(valid[1])
-        self._update_summary()
-
-    def settings(self):
-        return {
-            'marker_ind': int(self.marker.currentData()),
-            'start_frame': int(self.start_frame.value()),
-            'end_frame': int(self.end_frame.value()),
-            'mode': 'fixed' if self.fixed.isChecked() else 'follow',
-            'crop_size': int(self.crop_size.value()),
-            'camera_panels': [
-                index for index, control in enumerate((self.camera1, self.camera2))
-                if control.isChecked()
-            ],
-            'three_d': self.three_d.isChecked(),
-            'fps': float(self.playback_fps.value()),
-            'output_file': self.output_file.text().strip(),
-        }
-
-    def _update_summary(self, *args):
-        try:
-            preflight = self.st_win.video_export_preflight(self.settings())
-            self.summary.setText(preflight['summary'])
-            self.export_button.setEnabled(True)
-        except Exception as error:
-            self.summary.setText(str(error))
-            self.export_button.setEnabled(False)
-
-    def _export(self):
-        settings = self.settings()
-        if not settings['output_file']:
-            self.summary.setText('Choose an output AVI filename.')
-            return
-        if not settings['output_file'].lower().endswith('.avi'):
-            settings['output_file'] += '.avi'
-            self.output_file.setText(settings['output_file'])
-        if os.path.exists(settings['output_file']):
-            answer = QtWidgets.QMessageBox.question(
-                self, 'Replace existing AVI?',
-                f'{settings["output_file"]} already exists. Replace it?',
-                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-                QtWidgets.QMessageBox.StandardButton.No,
-            )
-            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
-                return
-        try:
-            result = self.st_win.export_tracked_video(settings)
-            self.summary.setText(result)
-        except Exception as error:
-            self.summary.setText(f'Video export failed: {error}')
-            self.st_win.console_write(str(error), 'video export failed')
 
 
 #######################
@@ -3716,6 +3572,10 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         load_avi_action.triggered.connect(self.load_avis)
         load_avi_action.setShortcut(QtCore.Qt.CTRL + QtCore.Qt.Key_O)
         file_menu.addAction(load_avi_action)
+        self.recent_video_menu = file_menu.addMenu('Recent video folders')
+        self.recent_video_menu.aboutToShow.connect(self.update_recent_video_menu)
+        file_menu.aboutToShow.connect(self.update_recent_video_menu)
+        self.update_recent_video_menu()
 
         file_menu.addSeparator()
 
@@ -3755,7 +3615,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
 
         file_menu.addActions([export_npy_action, export_npy_as_action, export_csv_action, export_csv_as_action])
 
-        export_video_action = QtWidgets.QAction('Export tracked video...', self)
+        export_video_action = QtWidgets.QAction('Export video...', self)
         export_video_action.triggered.connect(self.open_video_export_dialog)
         file_menu.addAction(export_video_action)
 
@@ -4121,39 +3981,90 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         self.grabKeyboard()
         self.setMouseTracking(True)
 
-    def load_avis(self, fn=None):
-        '''Load all corresponding videos into Imframes, then get the calibration
-        and the plumbline, if available, and load data if it exists.
+    def recent_video_directories(self):
+        """Read at most five unique, existing, normalized video folders."""
+        stored = self.qsettings.value('video/recent_directories', [])
+        if isinstance(stored, str):
+            stored = [stored]
+        folders = []
+        for path in stored or []:
+            if not isinstance(path, str) or not path:
+                continue
+            path = os.path.abspath(os.path.normpath(os.path.expanduser(path)))
+            if os.path.isdir(path) and path not in folders:
+                folders.append(path)
+        return folders[:5]
 
-        '''
-        # use a dialog if no fn
-        if not fn or not os.path.isfile(fn):
-            fn = str(QtWidgets.QFileDialog.getOpenFileName(self, 'Select video', '', VIDEO_FILTER)[0])
-        d, f = os.path.split(fn)
+    def update_recent_video_menu(self):
+        folders = self.recent_video_directories()
+        self.qsettings.setValue('video/recent_directories', folders)
+        self.recent_video_menu.clear()
+        self.recent_video_menu.setEnabled(bool(folders))
+        for folder in folders:
+            action = self.recent_video_menu.addAction(folder)
+            action.triggered.connect(lambda checked=False, directory=folder:
+                                     self.load_avis(initial_directory=directory))
+        if folders:
+            self.recent_video_menu.addSeparator()
+            self.recent_video_menu.addAction('Clear recent folders', self.clear_recent_video_folders)
 
-        # look for the corresponding file, starting with L or R
-        if f.startswith('L') and os.path.isfile(os.path.join(d, f'R{f[1:]}')):
-            filenames = [os.path.join(d, f), os.path.join(d, f'R{f[1:]}')]
+    def clear_recent_video_folders(self):
+        self.qsettings.setValue('video/recent_directories', [])
+        self.update_recent_video_menu()
 
-        elif f.startswith('R') and os.path.isfile(os.path.join(d, f'L{f[1:]}')):
-            filenames = [os.path.join(d, f'L{f[1:]}'), os.path.join(d, f)]
+    def remember_video_directories(self, first_filename, filenames):
+        folders = []
+        for filename in [first_filename, *filenames]:
+            folder = os.path.dirname(os.path.abspath(filename))
+            if os.path.isdir(folder) and folder not in folders:
+                folders.append(folder)
+        folders += [folder for folder in self.recent_video_directories() if folder not in folders]
+        self.qsettings.setValue('video/last_directory', os.path.dirname(os.path.abspath(first_filename)))
+        self.qsettings.setValue('video/recent_directories', folders[:5])
+        self.update_recent_video_menu()
 
-        # or if fn dialog was cancelled
-        elif f == '':
+    def choose_video_file(self, title, initial_directory=None):
+        """Large, local Qt chooser, with screen-constrained size persistence."""
+        if not initial_directory or not os.path.isdir(initial_directory):
+            initial_directory = self.qsettings.value('video/last_directory', '')
+        if not initial_directory or not os.path.isdir(initial_directory):
+            initial_directory = os.getcwd()
+        dialog = QtWidgets.QFileDialog(self, title, initial_directory, VIDEO_FILTER)
+        dialog.setOption(QtWidgets.QFileDialog.DontUseNativeDialog, True)
+        dialog.setFileMode(QtWidgets.QFileDialog.ExistingFile)
+        dialog.setAcceptMode(QtWidgets.QFileDialog.AcceptOpen)
+        available = self.screen().availableGeometry()
+        # Leave room for decorations and desktop panels, even after changing monitors.
+        maximum = QtCore.QSize(int(available.width() * .90), int(available.height() * .90))
+        default = QtCore.QSize(int(available.width() * .80), int(available.height() * .80))
+        saved = self.qsettings.value('video/chooser_size', default)
+        if not isinstance(saved, QtCore.QSize) or saved.width() < 200 or saved.height() < 150:
+            saved = default
+        dialog.setMinimumSize(min(480, maximum.width()), min(320, maximum.height()))
+        dialog.setMaximumSize(maximum)
+        dialog.resize(saved.boundedTo(maximum))
+        dialog.move(available.center() - dialog.rect().center())
+        accepted = dialog.exec_() == QtWidgets.QDialog.Accepted
+        self.qsettings.setValue('video/chooser_size', dialog.size().boundedTo(maximum))
+        selected = dialog.selectedFiles()
+        dialog.deleteLater()
+        return selected[0] if accepted and selected else ''
+
+    def load_avis(self, fn=None, initial_directory=None):
+        """Select a stereo pair, then use the existing validated loading pipeline."""
+        if not fn or isinstance(fn, bool) or not os.path.isfile(fn):
+            fn = self.choose_video_file('Select video', initial_directory)
+        if not fn:
             return
-
-        # or open a dialog to get the other file
+        first_filename = os.path.abspath(fn)
+        pair = find_stereo_pair(first_filename)
+        if pair is not None:
+            filenames = list(pair)
         else:
-            # filenames = [None, None]
-            fn = str(QtWidgets.QFileDialog.getOpenFileName(self, 'Select other video', '', VIDEO_FILTER)[0])
-            d2, f2 = os.path.split(fn)
-
-            # if dialog was cancelled
-            if f2 == '':
+            second_filename = self.choose_video_file('Select other video', os.path.dirname(first_filename))
+            if not second_filename:
                 return
-            # otherwise this is the second
-            else:
-                filenames = [os.path.join(d, f), os.path.join(d2, f2)]
+            filenames = [first_filename, os.path.abspath(second_filename)]
 
         # load the images
         prepared = []
@@ -4212,6 +4123,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         self.frame_slider.set_displayed_marker(timeline_marker)
         self.refresh_marker_timeline(clear_selection=True)
         self.console_write(f'{self.fns[0]}\n{self.fns[1]}', 'loaded videos')
+        self.remember_video_directories(first_filename, filenames)
 
     def set_chessboard_size(self, board_rows, board_cols):
         '''Set the calibration rows and columns. The inner squares are one
@@ -5400,10 +5312,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
 
             self.get_data_fn = False
 
-            ddir, dname = os.path.split(self.fns[0])
-            if dname[0] in 'LR': dname = dname[1:]
-            dfn = f'2D{dname[:-3]}npy'
-            ddefaultname = os.path.join(ddir, dfn)
+            ddefaultname = default_recording_output(self.fns[0], '2D', '.npy')
 
             data_fn = str(
                 QtWidgets.QFileDialog.getSaveFileName(self, 'Save Data As', ddefaultname, 'npy files (*.npy)')[0])
@@ -5419,274 +5328,12 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
             self.console_write('no save filename')
 
     def open_video_export_dialog(self):
-        '''Open tracked/fixed raw-camera and 3D AVI export settings.'''
+        '''Compose source cameras, marker crops and Matplotlib 3D panels.'''
+        from video_export_dialog import VideoExportDialog
         if len(self.ims) != 2 or not all(getattr(im, 'fn', '') for im in self.ims):
             self.console_write('Load the camera videos before exporting.', 'video export failed')
             return
         VideoExportDialog(self, self).exec_()
-
-    def marker_export_valid_range(self, marker_ind, camera_ind):
-        '''Return the first/last finite current trajectory positions, if any.'''
-        if not (0 <= int(camera_ind) < len(self.ims)):
-            return None
-        im = self.ims[int(camera_ind)]
-        valid = []
-        for frame_ind in range(im.num_frames):
-            x, y, _ = im.get_data(int(marker_ind), frame_ind)
-            if np.isfinite(x) and np.isfinite(y):
-                valid.append(frame_ind)
-        return (valid[0], valid[-1]) if valid else None
-
-    def _marker_export_positions(self, marker_ind, camera_ind, start_frame, end_frame):
-        '''Read Jink's explicit/interpolated 2D trajectory for an inclusive range.'''
-        im = self.ims[camera_ind]
-        if start_frame < 0 or end_frame >= im.num_frames:
-            raise ValueError(
-                f'Camera {camera_ind + 1} contains frames 0–{im.num_frames - 1}; '
-                f'cannot export {start_frame}–{end_frame}.'
-            )
-        positions = np.empty((end_frame - start_frame + 1, 2), dtype=float)
-        for offset, frame_ind in enumerate(range(start_frame, end_frame + 1)):
-            x, y, _ = im.get_data(marker_ind, frame_ind)
-            positions[offset] = x, y
-        if not np.all(np.isfinite(positions)):
-            valid = self.marker_export_valid_range(marker_ind, camera_ind)
-            valid_text = 'none' if valid is None else f'{valid[0]}–{valid[1]}'
-            raise ValueError(
-                f'Marker {marker_ind + 1} does not have a valid Camera {camera_ind + 1} '
-                f'position over frames {start_frame}–{end_frame}. Valid range is {valid_text}.'
-            )
-        return positions
-
-    def video_export_preflight(self, settings):
-        '''Validate export dependencies and calculate crop/composite geometry.'''
-        marker_ind = int(settings['marker_ind'])
-        start_frame = int(settings['start_frame'])
-        end_frame = int(settings['end_frame'])
-        camera_panels = list(settings['camera_panels'])
-        include_3d = bool(settings['three_d'])
-        if not camera_panels and not include_3d:
-            raise ValueError('Select at least one output panel.')
-        if any(camera_ind not in range(len(self.ims)) for camera_ind in camera_panels):
-            raise ValueError(f'Invalid camera panel selection: {camera_panels}.')
-        if not (0 <= marker_ind < self.num_markers):
-            raise ValueError(f'Marker {marker_ind + 1} is outside the available marker range.')
-        if not (0 <= start_frame <= end_frame < self.num_frames):
-            raise ValueError(
-                f'Frames must satisfy 0 ≤ start ≤ end < {self.num_frames}; '
-                f'got {start_frame}–{end_frame}.'
-            )
-        if not np.isfinite(settings['fps']) or float(settings['fps']) <= 0:
-            raise ValueError('Playback FPS must be greater than zero.')
-        if settings['mode'] not in ('follow', 'fixed'):
-            raise ValueError(f'Unknown video export view mode: {settings["mode"]}.')
-        if int(settings['crop_size']) < 1:
-            raise ValueError('Crop size must be greater than zero.')
-
-        positions = {
-            camera_ind: self._marker_export_positions(
-                marker_ind, camera_ind, start_frame, end_frame
-            )
-            for camera_ind in camera_panels
-        }
-        fixed_centers = {}
-        required_sizes = {}
-        requested_size = int(settings['crop_size'])
-        actual_size = requested_size
-        if settings['mode'] == 'fixed':
-            for camera_ind, camera_positions in positions.items():
-                minimum = camera_positions.min(axis=0)
-                maximum = camera_positions.max(axis=0)
-                fixed_centers[camera_ind] = (minimum + maximum) / 2.
-                span = float(np.max(maximum - minimum))
-                required_sizes[camera_ind] = max(1, int(np.ceil(span * 1.10)))
-            if required_sizes:
-                actual_size = max(requested_size, max(required_sizes.values()))
-
-        if include_3d:
-            if not self.td.got_cal:
-                raise ValueError('3D output requires calibrated camera geometry.')
-            valid_3d = np.asarray(self.td.get_valid_inds(marker_ind), dtype=int)
-            requested_frames = np.arange(start_frame, end_frame + 1, dtype=int)
-            if (not np.all(np.isin(requested_frames, valid_3d))
-                    or not np.all(np.isfinite(self.td.data[marker_ind, :, requested_frames]))):
-                if valid_3d.size:
-                    valid_text = f'{valid_3d.min()}–{valid_3d.max()}'
-                else:
-                    valid_text = 'none'
-                raise ValueError(
-                    f'3D output requires a valid 3D trajectory for marker {marker_ind + 1} '
-                    f'over frames {start_frame}–{end_frame}. Valid range is {valid_text}.'
-                )
-
-        panel_names = [f'Camera {index + 1}' for index in camera_panels]
-        if include_3d:
-            panel_names.append('3D')
-        frame_count = end_frame - start_frame + 1
-        duration = frame_count / float(settings['fps'])
-        summary_lines = [
-            f'Frames: {start_frame}–{end_frame} ({frame_count} frames)',
-            f'Panels: {", ".join(panel_names)}',
-            f'Panel size: {actual_size} × {actual_size}',
-            f'Output size: {actual_size * len(panel_names)} × {actual_size}',
-            f'Playback: {float(settings["fps"]):g} fps; duration: {duration:.2f} s',
-        ]
-        if settings['mode'] == 'fixed' and required_sizes:
-            required = max(required_sizes.values())
-            summary_lines.append(
-                f'Requested crop size: {requested_size} px; fixed-view trajectory '
-                f'requires: {required} px; actual panel size: {actual_size} px.'
-            )
-        return {
-            'positions': positions,
-            'fixed_centers': fixed_centers,
-            'required_sizes': required_sizes,
-            'panel_size': actual_size,
-            'panel_names': panel_names,
-            'frame_count': frame_count,
-            'summary': '\n'.join(summary_lines),
-        }
-
-    def _capture_3d_export_panel(self, size):
-        '''Capture the live GL viewport and resize its centered square crop.'''
-        view = self.td.view
-        view.update()
-        QtWidgets.QApplication.processEvents()
-        view.repaint()
-
-        framebuffer = view.grabFramebuffer()
-        if framebuffer.isNull():
-            raise ValueError('Could not capture the 3D OpenGL framebuffer.')
-        framebuffer = framebuffer.convertToFormat(QtGui.QImage.Format_RGBA8888)
-        width = framebuffer.width()
-        height = framebuffer.height()
-        bytes_per_line = framebuffer.bytesPerLine()
-        pointer = framebuffer.bits()
-        pointer.setsize(height * bytes_per_line)
-        rgba = np.frombuffer(pointer, dtype=np.uint8).reshape(height, bytes_per_line)
-        rgba = rgba[:, :width * 4].reshape(height, width, 4).copy()
-
-        # QOpenGLWidget.grabFramebuffer returns a top-left-oriented QImage.
-        bgr = cv.cvtColor(rgba, cv.COLOR_RGBA2BGR)
-        return _center_crop_image_to_square(bgr, size)
-
-    def export_tracked_video(self, settings):
-        '''Write selected raw-camera crops and the current 3D view to one AVI.'''
-        preflight = self.video_export_preflight(settings)
-        output_file = settings['output_file']
-        if not output_file:
-            raise ValueError('Choose an output AVI filename.')
-        if not output_file.lower().endswith('.avi'):
-            output_file += '.avi'
-        output_path = os.path.abspath(output_file)
-        source_paths = {os.path.abspath(fn) for fn in self.fns if fn}
-        if output_path in source_paths:
-            raise ValueError('The export filename must not overwrite a loaded source video.')
-
-        panel_size = preflight['panel_size']
-        camera_panels = list(settings['camera_panels'])
-        original_frame = int(self.frame_slider.value())
-        captures = {}
-        writer = None
-        canceled = False
-        original_point_sizes = []
-        original_line_widths = []
-        progress = QtWidgets.QProgressDialog(
-            'Preparing video export...', 'Cancel', 0, preflight['frame_count'], self
-        )
-        progress.setWindowTitle('Export tracked video')
-        progress.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
-        progress.setMinimumDuration(0)
-        try:
-            if settings['three_d']:
-                original_point_sizes = [
-                    np.array(point.size, copy=True)
-                    if isinstance(point.size, np.ndarray) else point.size
-                    for point in self.td.points
-                ]
-                original_line_widths = [line.width for line in self.td.lines]
-                for point, original_size in zip(self.td.points, original_point_sizes):
-                    point.setData(size=original_size * 1.75)
-                for line, original_width in zip(self.td.lines, original_line_widths):
-                    line.setData(width=original_width * 1.5)
-
-            for camera_ind in camera_panels:
-                capture = open_video(self.fns[camera_ind])
-                if not capture.isOpened():
-                    raise ValueError(f'Could not open {self.fns[camera_ind]} for export.')
-                capture.set(cv.CAP_PROP_POS_FRAMES, settings['start_frame'])
-                captures[camera_ind] = capture
-
-            width = panel_size * len(preflight['panel_names'])
-            fourcc = cv.VideoWriter_fourcc(*'MJPG')
-            writer = cv.VideoWriter(
-                output_file, fourcc, float(settings['fps']), (width, panel_size), True
-            )
-            if not writer.isOpened():
-                raise ValueError(f'Could not create AVI writer for {output_file}.')
-
-            for offset, frame_ind in enumerate(
-                    range(settings['start_frame'], settings['end_frame'] + 1)):
-                progress.setLabelText(
-                    f'Rendering frame {offset + 1} / {preflight["frame_count"]}'
-                )
-                QtWidgets.QApplication.processEvents()
-                if progress.wasCanceled():
-                    canceled = True
-                    break
-
-                panels = []
-                for camera_ind in camera_panels:
-                    ok, frame = captures[camera_ind].read()
-                    if not ok or frame is None:
-                        raise ValueError(
-                            f'Could not read Camera {camera_ind + 1} frame {frame_ind}.'
-                        )
-                    if frame.ndim == 2:
-                        frame = cv.cvtColor(frame, cv.COLOR_GRAY2BGR)
-                    elif frame.shape[2] == 4:
-                        frame = cv.cvtColor(frame, cv.COLOR_BGRA2BGR)
-                    center = (
-                        preflight['fixed_centers'][camera_ind]
-                        if settings['mode'] == 'fixed'
-                        else preflight['positions'][camera_ind][offset]
-                    )
-                    panels.append(_crop_square_with_padding(frame, center, panel_size))
-
-                if settings['three_d']:
-                    self.td.set_frame(frame_ind)
-                    marker_point = self.td.points[settings['marker_ind']]
-                    if not marker_point.visible():
-                        raise ValueError(
-                            f'3D marker {settings["marker_ind"] + 1} is not visible '
-                            f'at frame {frame_ind}.'
-                        )
-                    panels.append(self._capture_3d_export_panel(panel_size))
-
-                composite = np.ascontiguousarray(np.hstack(panels), dtype=np.uint8)
-                writer.write(composite)
-                progress.setValue(offset + 1)
-        finally:
-            if writer is not None:
-                writer.release()
-            for capture in captures.values():
-                capture.release()
-            for point, original_size in zip(self.td.points, original_point_sizes):
-                point.setData(size=original_size)
-            for line, original_width in zip(self.td.lines, original_line_widths):
-                line.setData(width=original_width)
-            progress.close()
-            self.change_frame(original_frame)
-
-        if canceled:
-            message = (
-                f'Video export canceled. Partial AVI retained at:\n{output_file}'
-            )
-            self.console_write(message, 'video export')
-            return message
-        message = f'{preflight["summary"]}\n\nSaved: {output_file}'
-        self.console_write(message, 'video export')
-        return message
 
     def export_npy_as(self):
         '''Save the marker and 3d data with a dialog to get the filename.
@@ -5704,10 +5351,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
 
             self.get_npy_fn = False
 
-            ddir, dname = os.path.split(self.fns[0])
-            if dname[0] in 'LR': dname = dname[1:]
-            dfn = f'3D{dname[:-3]}npy'
-            ddefaultname = os.path.join(ddir, dfn)
+            ddefaultname = default_recording_output(self.fns[0], '3D', '.npy')
 
             npy_fn = str(
                 QtWidgets.QFileDialog.getSaveFileName(self, 'Save Data As', ddefaultname, 'npy files (*.npy)')[0])
@@ -5738,10 +5382,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
 
             self.get_csv_fn = False
 
-            ddir, dname = os.path.split(self.fns[0])
-            if dname[0] in 'LR': dname = dname[1:]
-            dfn = f'3D{dname[:-3]}csv'
-            ddefaultname = os.path.join(ddir, dfn)
+            ddefaultname = default_recording_output(self.fns[0], '3D', '.csv')
 
             csv_fn = str(
                 QtWidgets.QFileDialog.getSaveFileName(self, 'Save Data As', ddefaultname, 'csv files (*.csv)')[0])
@@ -5902,15 +5543,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
             self.console_write('Need camera geometry first')
             return
 
-        # get the directory and file name
-        cdir, cname = os.path.split(self.fns[0])
-        # if we start with L or R, drop that for the save name
-        if cname.startswith('L') or cname.startswith('R'):
-            cname = cname[1:]
-        # get rid of the video extension
-        cname = cname.rsplit('.', 1)[0]
-        cname = f'C{cname}.npy'
-        cdefaultname = os.path.join(cdir, cname)
+        cdefaultname = default_recording_output(self.fns[0], 'camera-geometry', '.npy')
 
         fn = str(
             QtWidgets.QFileDialog.getSaveFileName(self, 'Save camera geometry', cdefaultname, 'npy files (*.npy)')[0])
@@ -5947,15 +5580,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
             self.console_write('Need orientation first')
             return
 
-        # get the directory and file name
-        pdir, pname = os.path.split(self.fns[0])
-        # if we start with L or R, drop that for the save name
-        if pname.startswith('L') or pname.startswith('R'):
-            pname = pname[1:]
-        # get rid of the video extension
-        pname = pname.rsplit('.', 1)[0]
-        pname = f'P{pname}.npy'
-        pdefaultname = os.path.join(pdir, pname)
+        pdefaultname = default_recording_output(self.fns[0], 'orientation', '.npy')
 
         fn = str(QtWidgets.QFileDialog.getSaveFileName(self, 'Save orientation', pdefaultname, 'npy files (*.npy)')[0])
 
@@ -6131,7 +5756,7 @@ class Stereography_window(QtWidgets.QMainWindow):  # QWidget
         '''Runs the app.
 
         '''
-        self.show()
+        self.showMaximized()
         pg.QtWidgets.QApplication.exec()
 
     def print_help(self):
